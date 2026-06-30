@@ -1,0 +1,825 @@
+import Cocoa
+import SwiftUI
+import IOKit
+import ServiceManagement
+
+// MARK: - Power reading
+
+struct PowerSnapshot {
+    var systemW: Double = 0      // total Mac consumption (BatteryData.SystemPower)
+    var adapterW: Double = 0     // power delivered by the wall adapter
+    var batteryW: Double = 0     // signed: + charging into battery, - discharging
+    var external: Bool = false   // adapter connected
+    var charging: Bool = false
+    var soc: Int = 0
+    var adapterRatedW: Int = 0
+    var timeToEmpty: Int = -1
+    var timeToFull: Int = -1
+    var valid: Bool = false
+    // health / spec
+    var designCap: Int = 0       // mAh
+    var rawMaxCap: Int = 0       // mAh (current full capacity)
+    var cycleCount: Int = 0
+    var tempC: Double = 0        // °C
+    var serial: String = ""
+    var adapterVoltage: Double = 0  // V
+    var adapterCurrent: Double = 0  // A
+    var adapterDesc: String = ""
+    var batteryVoltage: Double = 0  // V
+
+    var healthPct: Int { designCap > 0 ? Int((Double(rawMaxCap) / Double(designCap) * 100).rounded()) : 0 }
+    var condition: String { healthPct >= 80 ? "정상" : (healthPct >= 60 ? "양호" : "서비스 권장") }
+}
+
+enum PowerReader {
+    static func read() -> PowerSnapshot {
+        var s = PowerSnapshot()
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSmartBattery"))
+        guard svc != 0 else { return s }
+        defer { IOObjectRelease(svc) }
+        var propsRef: Unmanaged<CFMutableDictionary>?
+        guard IORegistryEntryCreateCFProperties(svc, &propsRef, kCFAllocatorDefault, 0) == KERN_SUCCESS,
+              let p = propsRef?.takeRetainedValue() as? [String: Any] else { return s }
+
+        let amperage = (p["Amperage"] as? Int) ?? 0
+        let voltage  = (p["Voltage"]  as? Int) ?? 0
+        s.external   = (p["ExternalConnected"] as? Bool) ?? false
+        s.charging   = (p["IsCharging"] as? Bool) ?? false
+        s.soc        = (p["CurrentCapacity"] as? Int) ?? 0
+        s.batteryW   = Double(amperage) * Double(voltage) / 1_000_000.0
+        s.timeToEmpty = (p["TimeRemaining"] as? Int) ?? (p["AvgTimeToEmpty"] as? Int ?? -1)
+        s.timeToFull  = (p["AvgTimeToFull"] as? Int) ?? -1
+
+        if let bd = p["BatteryData"] as? [String: Any] {
+            if let sp = bd["SystemPower"]  as? Double { s.systemW  = sp }
+            else if let sp = bd["SystemPower"] as? Int { s.systemW = Double(sp) }
+            if let ap = bd["AdapterPower"] as? Double { s.adapterW = ap }
+            else if let ap = bd["AdapterPower"] as? Int { s.adapterW = Double(ap) }
+        }
+        if s.systemW == 0 {
+            if !s.external { s.systemW = abs(s.batteryW) }
+            else { s.systemW = max(0, s.adapterW - max(0, s.batteryW)) }
+        }
+        if let ad = p["AdapterDetails"] as? [String: Any] {
+            s.adapterRatedW = (ad["Watts"] as? Int) ?? 0
+            s.adapterVoltage = Double((ad["AdapterVoltage"] as? Int) ?? 0) / 1000.0
+            s.adapterCurrent = Double((ad["Current"] as? Int) ?? 0) / 1000.0
+            s.adapterDesc = (ad["Description"] as? String) ?? ""
+        }
+        if abs(s.adapterW) < 0.05 { s.adapterW = 0 }
+        // health / spec
+        s.designCap   = (p["DesignCapacity"] as? Int) ?? 0
+        s.rawMaxCap   = (p["AppleRawMaxCapacity"] as? Int) ?? ((p["NominalChargeCapacity"] as? Int) ?? 0)
+        s.cycleCount  = (p["CycleCount"] as? Int) ?? 0
+        s.tempC       = Double((p["Temperature"] as? Int) ?? 0) / 100.0
+        s.serial      = (p["Serial"] as? String) ?? ""
+        s.batteryVoltage = Double(voltage) / 1000.0
+        s.valid = true
+        return s
+    }
+}
+
+// MARK: - State classification
+
+enum PowerState {
+    case battery     // unplugged: battery -> mac
+    case idle        // plugged but adapter ~0, running off battery
+    case charging    // adapter -> mac + adapter -> battery
+    case boost       // adapter insufficient: adapter -> mac + battery -> mac
+    case powering    // adapter -> mac, battery held
+}
+
+// MARK: - Model
+
+final class PowerModel: ObservableObject {
+    @Published var snap = PowerSnapshot()
+    @Published var state: PowerState = .battery
+    @Published var macHealthPct: Int? = nil    // macOS "성능 최대치" (system_profiler)
+    @Published var macCondition: String = ""
+
+    private var idleStreak = 0
+    private let idleThreshold = 3
+    private var timer: Timer?
+    private var healthTimer: Timer?
+    var onTick: (() -> Void)?
+
+    var chargeW: Double { max(0, snap.batteryW) }
+    var dischargeW: Double { max(0, -snap.batteryW) }
+
+    var interval: Double { max(1, (UserDefaults.standard.object(forKey: "refreshInterval") as? Double) ?? 2.0) }
+
+    func restartTimer() {
+        timer?.invalidate()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in self?.tick() }
+    }
+
+    func start() {
+        tick()
+        timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in self?.tick() }
+        sampleMacHealth()
+        healthTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in self?.sampleMacHealth() }
+    }
+
+    // Read macOS's official "Maximum Capacity %" + Condition (smoothed Apple metric).
+    private func sampleMacHealth() {
+        DispatchQueue.global().async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/sbin/system_profiler")
+            p.arguments = ["SPPowerDataType"]
+            let pipe = Pipe(); p.standardOutput = pipe; p.standardError = nil
+            do { try p.run() } catch { return }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            let out = String(data: data, encoding: .utf8) ?? ""
+            var pct: Int? = nil; var cond = ""
+            for raw in out.split(separator: "\n") {
+                let t = raw.trimmingCharacters(in: .whitespaces)
+                if t.hasPrefix("Maximum Capacity:") {
+                    let v = t.replacingOccurrences(of: "Maximum Capacity:", with: "")
+                        .replacingOccurrences(of: "%", with: "").trimmingCharacters(in: .whitespaces)
+                    pct = Int(v)
+                } else if t.hasPrefix("Condition:") {
+                    cond = t.replacingOccurrences(of: "Condition:", with: "").trimmingCharacters(in: .whitespaces)
+                }
+            }
+            DispatchQueue.main.async {
+                self.macHealthPct = pct
+                self.macCondition = (cond == "Normal") ? "정상" : cond
+            }
+        }
+    }
+
+    private func tick() {
+        let s = PowerReader.read()
+        guard s.valid else { return }
+        let adapterActive = s.external && s.adapterW > 0.5
+        let dis = max(0, -s.batteryW)
+        let chg = max(0, s.batteryW)
+
+        if s.external && !adapterActive && dis > 1.0 { idleStreak += 1 } else { idleStreak = 0 }
+
+        let st: PowerState
+        if !s.external {
+            st = .battery
+        } else if adapterActive {
+            if chg > 0.1 { st = .charging }
+            else if dis > 0.1 { st = .boost }
+            else { st = .powering }
+        } else if idleStreak >= idleThreshold {
+            st = .idle
+        } else {
+            st = .powering
+        }
+        self.snap = s
+        self.state = st
+        onTick?()
+    }
+}
+
+func fmtW(_ w: Double) -> String {
+    let dec = (UserDefaults.standard.object(forKey: "showDecimals") as? Bool) ?? true
+    return dec ? String(format: "%.1fW", w) : String(format: "%.0fW", w)
+}
+
+// MARK: - Top energy apps (no-sudo CPU proxy for Activity-Monitor-style "energy" list)
+
+struct AppCPU: Identifiable { let id = UUID(); let name: String; let cpu: Double }
+
+final class TopApps: ObservableObject {
+    @Published var apps: [AppCPU] = []
+    private var timer: Timer?
+
+    func start() {
+        sample()
+        timer = Timer.scheduledTimer(withTimeInterval: 5.0, repeats: true) { [weak self] _ in self?.sample() }
+    }
+
+    private func sample() {
+        DispatchQueue.global().async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/ps")
+            p.arguments = ["-Aro", "%cpu=,comm="]   // all procs, sorted by cpu desc, no header
+            let pipe = Pipe(); p.standardOutput = pipe; p.standardError = nil
+            do { try p.run() } catch { return }
+            let data = pipe.fileHandleForReading.readDataToEndOfFile()
+            p.waitUntilExit()
+            let out = String(data: data, encoding: .utf8) ?? ""
+            var res: [AppCPU] = []
+            for line in out.split(separator: "\n") {
+                let t = line.trimmingCharacters(in: .whitespaces)
+                guard let sp = t.firstIndex(of: " ") else { continue }
+                guard let cpu = Double(t[..<sp]) else { continue }
+                if cpu < 0.5 { continue }
+                var name = String(t[t.index(after: sp)...]).trimmingCharacters(in: .whitespaces)
+                if let slash = name.range(of: "/", options: .backwards) { name = String(name[slash.upperBound...]) }
+                res.append(AppCPU(name: name, cpu: cpu))
+                if res.count >= 5 { break }
+            }
+            DispatchQueue.main.async { self.apps = res }
+        }
+    }
+}
+
+// MARK: - Charge limit engine (delegates privileged SMC control to the `battery` CLI)
+
+final class BatteryEngine: ObservableObject {
+    @Published var installed = false
+    @Published var limit: Int? = nil          // nil = no limit (충전 제한 끔)
+    @Published var sailing: Bool = UserDefaults.standard.bool(forKey: "sailing")
+    @Published var lastCalibration: Date? = UserDefaults.standard.object(forKey: "lastCalibration") as? Date
+    private let home = NSHomeDirectory()
+    private var binPath: String?
+
+    private func findBin() -> String? {
+        let candidates = ["\(home)/.battery/battery",
+                          "/opt/homebrew/bin/battery",
+                          "/usr/local/bin/battery"]
+        for c in candidates where FileManager.default.isExecutableFile(atPath: c) { return c }
+        return nil
+    }
+
+    func refresh() {
+        binPath = findBin()
+        installed = (binPath != nil)
+        // The `battery` CLI stores its maintain target under ~/.battery/
+        let candidates = ["\(home)/.battery/maintain.percentage",
+                          "\(home)/.battery/.maintain.percentage"]
+        var found: Int? = nil
+        for f in candidates {
+            if let txt = try? String(contentsOfFile: f, encoding: .utf8) {
+                let t = txt.trimmingCharacters(in: .whitespacesAndNewlines)
+                if t.contains("-") {                       // sailing range "75-80" → upper bound
+                    let parts = t.split(separator: "-")
+                    if parts.count == 2, let hi = Int(parts[1]) { found = hi; break }
+                } else if let n = Int(t), (1...100).contains(n) { found = n; break }
+            }
+        }
+        limit = found
+    }
+
+    func setSailing(_ on: Bool) {
+        sailing = on
+        UserDefaults.standard.set(on, forKey: "sailing")
+        if let l = limit { setLimit(l) }   // re-apply current limit in new mode
+    }
+
+    private func envPath() -> [String: String] {
+        var env = ProcessInfo.processInfo.environment
+        env["PATH"] = "\(home)/.battery:/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin:/usr/sbin:/sbin"
+        return env
+    }
+
+    func setLimit(_ pct: Int?) {
+        guard let bin = binPath else { return }
+        limit = pct   // optimistic
+        let args: [String]
+        if let p = pct {
+            args = sailing ? ["maintain", "\(max(50, p-5))-\(p)"] : ["maintain", "\(p)"]
+        } else {
+            args = ["maintain", "stop"]
+        }
+        DispatchQueue.global().async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: bin)
+            p.arguments = args
+            p.environment = self.envPath()
+            p.standardOutput = nil; p.standardError = nil
+            try? p.run(); p.waitUntilExit()
+            DispatchQueue.main.async { self.refresh() }
+        }
+    }
+
+    // Long-running / forceful ops: launch fully detached so they survive and don't block.
+    private func runDetached(_ args: [String]) {
+        guard let bin = binPath else { return }
+        DispatchQueue.global().async {
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/bin/sh")
+            p.environment = self.envPath()
+            let cmd = ([bin] + args).map { "'\($0)'" }.joined(separator: " ")
+            p.arguments = ["-c", "\(cmd) >>\(self.home)/.battery/battery.log 2>&1 &"]
+            try? p.run(); p.waitUntilExit()
+            DispatchQueue.main.asyncAfter(deadline: .now() + 2) { self.refresh() }
+        }
+    }
+    func forceCharge() { runDetached(["charge", "100"]) }       // 일시적 100% 충전
+    func forceDischarge(to pct: Int) { runDetached(["discharge", "\(pct)"]) }
+    func calibrate() {
+        runDetached(["calibrate"])
+        let now = Date()
+        lastCalibration = now
+        UserDefaults.standard.set(now, forKey: "lastCalibration")
+    }
+}
+
+// MARK: - SwiftUI flow diagram
+
+struct NodeBox: View {
+    let emoji: String, label: String, value: String, dim: Bool
+    var body: some View {
+        VStack(spacing: 2) {
+            HStack(spacing: 5) {
+                Text(emoji).font(.system(size: 17))
+                Text(label).font(.system(size: 11, weight: .medium)).foregroundColor(.white.opacity(0.55))
+            }
+            Text(value).font(.system(size: 16, weight: .bold)).foregroundColor(.white)
+                .monospacedDigit()
+        }
+        .frame(width: 112, height: 58)
+        .background(RoundedRectangle(cornerRadius: 14).fill(Color(white: 0.18)))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color(white: 0.28), lineWidth: 1))
+        .opacity(dim ? 0.32 : 1)
+    }
+}
+
+struct Edge { let from: CGPoint; let to: CGPoint; let color: Color; let watts: Double }
+
+struct FlowCanvas: View {
+    let edges: [Edge]
+    // all three static edge lines for context
+    static let lines: [(CGPoint, CGPoint)] = [
+        (CGPoint(x: 150, y: 54), CGPoint(x: 210, y: 54)),
+        (CGPoint(x: 120, y: 82),  CGPoint(x: 150, y: 132)),
+        (CGPoint(x: 210, y: 132), CGPoint(x: 240, y: 82)),
+    ]
+    var body: some View {
+        TimelineView(.animation) { timeline in
+            let t = timeline.date.timeIntervalSinceReferenceDate
+            Canvas { ctx, _ in
+                // faint static edges
+                for l in Self.lines {
+                    var p = Path(); p.move(to: l.0); p.addLine(to: l.1)
+                    ctx.stroke(p, with: .color(Color(white: 0.22)), lineWidth: 2)
+                }
+                // animated dots
+                for e in edges {
+                    let n = max(2, min(8, Int((e.watts / 4).rounded())))
+                    let speed = min(1.0, 0.3 + e.watts * 0.03)   // cycles / sec
+                    for i in 0..<n {
+                        var f = (t * speed + Double(i) / Double(n)).truncatingRemainder(dividingBy: 1)
+                        if f < 0 { f += 1 }
+                        let x = e.from.x + (e.to.x - e.from.x) * f
+                        let y = e.from.y + (e.to.y - e.from.y) * f
+                        let glow = CGRect(x: x - 6, y: y - 6, width: 12, height: 12)
+                        ctx.fill(Path(ellipseIn: glow), with: .color(e.color.opacity(0.22)))
+                        let core = CGRect(x: x - 3, y: y - 3, width: 6, height: 6)
+                        ctx.fill(Path(ellipseIn: core), with: .color(e.color))
+                    }
+                }
+            }
+        }
+        .frame(width: 360, height: 198)
+    }
+}
+
+struct LimitChip: View {
+    let label: String
+    let active: Bool
+    let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Text(label)
+                .font(.system(size: 11, weight: active ? .semibold : .regular))
+                .foregroundColor(active ? .white : .white.opacity(0.7))
+                .frame(minWidth: 30)
+                .padding(.vertical, 5).padding(.horizontal, 9)
+                .background(RoundedRectangle(cornerRadius: 8)
+                    .fill(active ? Color.green.opacity(0.85) : Color(white: 0.2)))
+        }
+        .buttonStyle(.plain)
+    }
+}
+
+struct ActionButton: View {
+    let label: String; let color: Color; let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Text(label).font(.system(size: 11, weight: .medium)).foregroundColor(.white)
+                .frame(maxWidth: .infinity).padding(.vertical, 7)
+                .background(RoundedRectangle(cornerRadius: 8).fill(color.opacity(0.85)))
+        }.buttonStyle(.plain)
+    }
+}
+
+struct TabButton: View {
+    let title: String; let active: Bool; let action: () -> Void
+    var body: some View {
+        Button(action: action) {
+            Text(title).font(.system(size: 12, weight: active ? .semibold : .regular))
+                .foregroundColor(active ? .white : .white.opacity(0.5))
+                .padding(.vertical, 6).frame(maxWidth: .infinity)
+                .background(active ? Color(white: 0.2) : Color.clear)
+                .clipShape(RoundedRectangle(cornerRadius: 8))
+        }.buttonStyle(.plain)
+    }
+}
+
+struct StatRow: View {
+    let label: String; let value: String
+    var accent: Color = .white
+    var body: some View {
+        HStack {
+            Text(label).font(.system(size: 12)).foregroundColor(.white.opacity(0.55))
+            Spacer()
+            Text(value).font(.system(size: 12, weight: .medium)).foregroundColor(accent)
+                .monospacedDigit()
+        }
+        .padding(.vertical, 3)
+    }
+}
+
+struct PowerFlowView: View {
+    @ObservedObject var model: PowerModel
+    @ObservedObject var engine: BatteryEngine
+    @ObservedObject var topApps: TopApps
+    @State private var tab = 0
+    @State private var sliderVal: Double = 80
+    @State private var confirmDischarge = false
+    @State private var confirmCalibrate = false
+    @AppStorage("refreshInterval") private var refreshInterval: Double = 2.0
+    @AppStorage("showDecimals") private var showDecimals: Bool = true
+
+    // node centers
+    let adapterC = CGPoint(x: 94, y: 54)
+    let macC = CGPoint(x: 266, y: 54)
+    let battC = CGPoint(x: 180, y: 160)
+
+    var caption: (String, String) {
+        switch model.state {
+        case .charging: return ("⚡ 충전 중", "어댑터가 맥과 배터리에 동시 공급")
+        case .boost:    return ("🔌+🔋 동시 사용", "맥 소비 > 어댑터 · 배터리가 부족분 보충")
+        case .powering: return ("🔌 어댑터 구동", "어댑터가 맥만 구동 · 배터리 유지")
+        case .idle:     return ("🔋 배터리 구동", "어댑터 연결됨이나 유휴 · 배터리가 공급")
+        case .battery:  return ("🔋 배터리 구동", "어댑터 없음 · 배터리가 맥에 공급")
+        }
+    }
+
+    var edges: [Edge] {
+        let s = model.snap
+        let GREEN = Color.green, ORANGE = Color.orange, WHITE = Color.white.opacity(0.9)
+        let AM = (CGPoint(x: 150, y: 54), CGPoint(x: 210, y: 54))
+        let AB = (CGPoint(x: 120, y: 82),  CGPoint(x: 150, y: 132))
+        let BM = (CGPoint(x: 210, y: 132), CGPoint(x: 240, y: 82))
+        switch model.state {
+        case .charging:
+            return [Edge(from: AM.0, to: AM.1, color: GREEN, watts: s.systemW),
+                    Edge(from: AB.0, to: AB.1, color: GREEN, watts: model.chargeW)]
+        case .boost:
+            return [Edge(from: AM.0, to: AM.1, color: WHITE, watts: s.adapterW),
+                    Edge(from: BM.0, to: BM.1, color: ORANGE, watts: model.dischargeW)]
+        case .powering:
+            return [Edge(from: AM.0, to: AM.1, color: WHITE, watts: s.systemW)]
+        case .idle, .battery:
+            return [Edge(from: BM.0, to: BM.1, color: ORANGE, watts: s.systemW)]
+        }
+    }
+
+    var battArrow: String {
+        switch model.state {
+        case .charging: return " ↑"
+        case .boost, .idle, .battery: return " ↓"
+        case .powering: return " ="
+        }
+    }
+
+    var body: some View {
+        VStack(spacing: 0) {
+            HStack(spacing: 3) {
+                TabButton(title: "흐름", active: tab == 0) { tab = 0 }
+                TabButton(title: "건강", active: tab == 1) { tab = 1 }
+                TabButton(title: "충전", active: tab == 2) { tab = 2 }
+                TabButton(title: "설정", active: tab == 3) { tab = 3 }
+            }
+            .padding(.horizontal, 10).padding(.top, 8).padding(.bottom, 4)
+
+            Group {
+                switch tab {
+                case 0: flowTab
+                case 1: healthTab
+                case 2: chargeTab
+                default: settingsTab
+                }
+            }
+            .frame(height: 250)
+
+            Divider().background(Color(white: 0.3)).padding(.horizontal, 16)
+
+            HStack {
+                Text(footerText).font(.system(size: 11)).foregroundColor(.white.opacity(0.6))
+                Spacer()
+                Button(action: { NSApp.terminate(nil) }) {
+                    Text("종료").font(.system(size: 11))
+                }.buttonStyle(.plain).foregroundColor(.white.opacity(0.7))
+            }
+            .padding(.horizontal, 16).padding(.vertical, 9)
+        }
+        .frame(width: 380)
+        .background(Color(white: 0.11))
+    }
+
+    // MARK: Tab 1 — flow
+    var flowTab: some View {
+        let s = model.snap
+        let cap = caption
+        return VStack(spacing: 0) {
+            Text(cap.0).font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+                .padding(.top, 4)
+            Text(cap.1).font(.system(size: 11)).foregroundColor(.white.opacity(0.5))
+                .padding(.top, 3).frame(height: 16)
+            ZStack(alignment: .topLeading) {
+                FlowCanvas(edges: edges)
+                NodeBox(emoji: "⚡", label: "어댑터",
+                        value: s.external ? fmtW(s.adapterW) : "—",
+                        dim: (model.state == .battery || model.state == .idle))
+                    .position(adapterC)
+                NodeBox(emoji: "💻", label: "맥 사용", value: fmtW(s.systemW), dim: false)
+                    .position(macC)
+                NodeBox(emoji: "🔋", label: "배터리", value: "\(s.soc)%\(battArrow)", dim: false)
+                    .position(battC)
+            }
+            .frame(width: 360, height: 198)
+            Spacer(minLength: 0)
+        }
+    }
+
+    // MARK: Tab 2 — health
+    var healthTab: some View {
+        let s = model.snap
+        return ScrollView {
+            VStack(spacing: 1) {
+                StatRow(label: "배터리 건강",
+                        value: model.macHealthPct.map { "\($0)%  ·  \(model.macCondition.isEmpty ? s.condition : model.macCondition)" }
+                            ?? "\(s.healthPct)%  ·  \(s.condition)",
+                        accent: (model.macHealthPct ?? s.healthPct) >= 80 ? .green : .orange)
+                StatRow(label: "  └ 원시 용량비 (raw)", value: "\(s.healthPct)%")
+                StatRow(label: "설계 용량", value: "\(s.designCap) mAh")
+                StatRow(label: "최대 용량(원시)", value: "\(s.rawMaxCap) mAh")
+                StatRow(label: "충전 사이클", value: "\(s.cycleCount) 회")
+                StatRow(label: "배터리 온도", value: String(format: "%.1f °C", s.tempC))
+                StatRow(label: "배터리 전압", value: String(format: "%.2f V", s.batteryVoltage))
+                StatRow(label: "현재 잔량", value: "\(s.soc) %")
+                StatRow(label: model.state == .charging ? "가득 차는 시간" : "남은 사용 시간",
+                        value: timeValue)
+                Divider().background(Color(white: 0.25)).padding(.vertical, 4)
+                StatRow(label: "전원 어댑터",
+                        value: s.external ? "\(s.adapterRatedW) W" : "미연결",
+                        accent: s.external ? .white : .white.opacity(0.5))
+                if s.external {
+                    StatRow(label: "  └ 전압 / 전류",
+                            value: String(format: "%.1f V · %.2f A", s.adapterVoltage, s.adapterCurrent))
+                    if !s.adapterDesc.isEmpty {
+                        StatRow(label: "  └ 설명", value: s.adapterDesc)
+                    }
+                }
+                if !s.serial.isEmpty {
+                    StatRow(label: "직렬번호", value: s.serial)
+                }
+                Divider().background(Color(white: 0.25)).padding(.vertical, 4)
+                HStack {
+                    Text("에너지 사용 상위 앱").font(.system(size: 12, weight: .medium))
+                        .foregroundColor(.white.opacity(0.7))
+                    Spacer()
+                    Text("CPU 기준").font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
+                }
+                if topApps.apps.isEmpty {
+                    Text("측정 중…").font(.system(size: 11)).foregroundColor(.white.opacity(0.4))
+                        .frame(maxWidth: .infinity, alignment: .leading)
+                } else {
+                    ForEach(topApps.apps) { a in
+                        StatRow(label: a.name, value: String(format: "%.0f%%", a.cpu),
+                                accent: a.cpu > 50 ? .orange : .white)
+                    }
+                }
+            }
+            .padding(.horizontal, 16).padding(.top, 6).padding(.bottom, 8)
+        }
+    }
+
+    var timeValue: String {
+        let m = model.state == .charging ? model.snap.timeToFull : model.snap.timeToEmpty
+        guard m > 0 && m < 60 * 48 else { return "—" }
+        return String(format: "%d시간 %d분", m / 60, m % 60)
+    }
+
+    var calibrationText: String {
+        guard let d = engine.lastCalibration else { return "기록 없음" }
+        let f = DateFormatter(); f.dateFormat = "yyyy-MM-dd HH:mm"
+        return f.string(from: d)
+    }
+
+    // MARK: Tab 4 — settings
+    var settingsTab: some View {
+        VStack(alignment: .leading, spacing: 16) {
+            HStack {
+                Text("갱신 주기").font(.system(size: 12)).foregroundColor(.white.opacity(0.8))
+                Spacer()
+                Picker("", selection: $refreshInterval) {
+                    Text("1초").tag(1.0); Text("2초").tag(2.0); Text("5초").tag(5.0)
+                }
+                .pickerStyle(.segmented).frame(width: 170).labelsHidden()
+                .onChange(of: refreshInterval) { _ in model.restartTimer() }
+            }
+            Toggle(isOn: $showDecimals) {
+                Text("전력 소수점 표시 (3.4W / 3W)").font(.system(size: 12)).foregroundColor(.white.opacity(0.85))
+            }.toggleStyle(.switch).tint(.green)
+
+            Toggle(isOn: Binding(
+                get: { SMAppService.mainApp.status == .enabled },
+                set: { on in try? (on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()) }
+            )) {
+                Text("로그인 시 자동 시작").font(.system(size: 12)).foregroundColor(.white.opacity(0.85))
+            }.toggleStyle(.switch).tint(.green)
+
+            Spacer()
+            Text("PowerMeter 1.0  ·  IOKit + battery 엔진")
+                .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
+                .frame(maxWidth: .infinity, alignment: .center)
+        }
+        .padding(.horizontal, 16).padding(.top, 14)
+    }
+
+    // MARK: Tab 3 — charge control
+    var chargeTab: some View {
+        VStack(spacing: 12) {
+            HStack {
+                Text("충전 제한").font(.system(size: 13, weight: .medium))
+                    .foregroundColor(.white.opacity(0.85))
+                Spacer()
+                if engine.installed {
+                    Text(engine.limit.map { "\($0)%" } ?? "끔")
+                        .font(.system(size: 15, weight: .bold))
+                        .foregroundColor(engine.limit == nil ? .white.opacity(0.5) : .green)
+                } else {
+                    Text("엔진 미설치").font(.system(size: 12)).foregroundColor(.orange)
+                }
+            }
+
+            if engine.installed {
+                // slider 50–100
+                VStack(spacing: 2) {
+                    HStack(spacing: 8) {
+                        Button { let v = max(50, Int(sliderVal) - 5); sliderVal = Double(v); engine.setLimit(v) } label: {
+                            Image(systemName: "minus.circle.fill").font(.system(size: 18))
+                        }.buttonStyle(.plain).foregroundColor(.white.opacity(0.6))
+
+                        Slider(value: $sliderVal, in: 50...100, step: 5) { editing in
+                            if !editing { engine.setLimit(Int(sliderVal)) }
+                        }.tint(.green)
+
+                        Button { let v = min(100, Int(sliderVal) + 5); sliderVal = Double(v); engine.setLimit(v) } label: {
+                            Image(systemName: "plus.circle.fill").font(.system(size: 18))
+                        }.buttonStyle(.plain).foregroundColor(.white.opacity(0.6))
+                    }
+                    HStack { Text("50%"); Spacer(); Text("100%") }
+                        .font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
+                }
+
+                // presets
+                HStack(spacing: 6) {
+                    LimitChip(label: "끔", active: engine.limit == nil) { engine.setLimit(nil) }
+                    ForEach([60, 70, 80, 90, 100], id: \.self) { p in
+                        LimitChip(label: "\(p)", active: engine.limit == p) { engine.setLimit(p) }
+                    }
+                }
+
+                Toggle(isOn: Binding(get: { engine.sailing }, set: { engine.setSailing($0) })) {
+                    VStack(alignment: .leading, spacing: 1) {
+                        Text("Sailing (범위 유지)").font(.system(size: 11)).foregroundColor(.white.opacity(0.85))
+                        Text(engine.sailing && engine.limit != nil
+                             ? "\(max(50,(engine.limit ?? 80)-5))–\(engine.limit ?? 80)% 사이 유지"
+                             : "상한 도달 후 5% 내려가면 재충전").font(.system(size: 9)).foregroundColor(.white.opacity(0.4))
+                    }
+                }
+                .toggleStyle(.switch).tint(.green)
+
+                Divider().background(Color(white: 0.25))
+
+                // actions
+                HStack(spacing: 6) {
+                    ActionButton(label: "충전 100%", color: .green) { engine.forceCharge() }
+                    ActionButton(label: "방전", color: .orange) { confirmDischarge = true }
+                    ActionButton(label: "캘리브레이션", color: Color(white: 0.35)) { confirmCalibrate = true }
+                }
+                Text("방전: 어댑터 연결 중에도 제한%까지 강제 방전 · 캘리브레이션: 15→100→80% 전체 사이클")
+                    .font(.system(size: 9)).foregroundColor(.white.opacity(0.4))
+                    .frame(maxWidth: .infinity, alignment: .leading)
+                HStack {
+                    Text("마지막 보정").font(.system(size: 10)).foregroundColor(.white.opacity(0.45))
+                    Spacer()
+                    Text(calibrationText).font(.system(size: 10)).foregroundColor(.white.opacity(0.6))
+                }
+            } else {
+                VStack(alignment: .leading, spacing: 6) {
+                    Text("충전 제한 엔진(battery)이 설치되지 않았습니다.")
+                        .font(.system(size: 11)).foregroundColor(.orange)
+                    Text("battery 엔진을 설치하면 이 탭에서\n충전 상한·방전·캘리브레이션을 제어합니다.")
+                        .font(.system(size: 10)).foregroundColor(.white.opacity(0.45))
+                }
+                .frame(maxWidth: .infinity, alignment: .leading)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16).padding(.top, 10)
+        .onAppear { if let l = engine.limit { sliderVal = Double(l) } }
+        .onChange(of: engine.limit) { newVal in if let l = newVal { sliderVal = Double(l) } }
+        .alert("강제 방전", isPresented: $confirmDischarge) {
+            Button("취소", role: .cancel) {}
+            Button("방전 시작", role: .destructive) {
+                engine.forceDischarge(to: engine.limit ?? Int(sliderVal))
+            }
+        } message: {
+            Text("어댑터가 연결돼 있어도 \(engine.limit ?? Int(sliderVal))%까지 배터리를 강제로 방전합니다.")
+        }
+        .alert("배터리 캘리브레이션", isPresented: $confirmCalibrate) {
+            Button("취소", role: .cancel) {}
+            Button("시작", role: .destructive) { engine.calibrate() }
+        } message: {
+            Text("15%까지 방전 → 100% 충전 → 1시간 유지 → 80% 방전. 수 시간 걸리며 그동안 충전 제한이 해제됩니다.")
+        }
+    }
+
+    var footerText: String {
+        let s = model.snap
+        if s.adapterRatedW > 0 && s.external {
+            return "정격 \(s.adapterRatedW)W 어댑터"
+        }
+        if model.timeStr.isEmpty { return "" }
+        return model.timeStr
+    }
+}
+
+extension PowerModel {
+    var timeStr: String {
+        let m = state == .charging ? snap.timeToFull : snap.timeToEmpty
+        guard m > 0 && m < 60 * 48 else { return "" }
+        return (state == .charging ? "완충까지 " : "남은 시간 ") + String(format: "%d:%02d", m/60, m%60)
+    }
+}
+
+// MARK: - App
+
+class AppDelegate: NSObject, NSApplicationDelegate {
+    let statusItem = NSStatusBar.system.statusItem(withLength: NSStatusItem.variableLength)
+    let model = PowerModel()
+    let engine = BatteryEngine()
+    let topApps = TopApps()
+    let popover = NSPopover()
+
+    func applicationDidFinishLaunching(_ note: Notification) {
+        engine.refresh()
+        topApps.start()
+        popover.behavior = .transient
+        popover.contentSize = NSSize(width: 380, height: 380)
+        popover.contentViewController = NSHostingController(rootView: PowerFlowView(model: model, engine: engine, topApps: topApps))
+
+        if let btn = statusItem.button {
+            btn.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+            btn.title = "…W"
+            btn.action = #selector(togglePopover)
+            btn.target = self
+        }
+        model.onTick = { [weak self] in
+            self?.updateTitle()
+            self?.engine.refresh()
+        }
+        model.start()
+    }
+
+    func updateTitle() {
+        let s = model.snap
+        let chargeW = max(0, s.batteryW)
+        let dischargeW = max(0, -s.batteryW)
+        let title: String
+        let color: NSColor
+        let pct = "\(s.soc)%"
+        switch model.state {
+        case .battery, .idle:
+            title = "🔋 \(pct) \(fmtW(s.systemW))"; color = .systemOrange
+        case .charging:
+            title = "🔌 \(pct) \(fmtW(s.systemW)) ＋\(fmtW(chargeW))"; color = .systemGreen
+        case .boost:
+            title = "🔌 \(pct) \(fmtW(s.systemW)) ▼\(fmtW(dischargeW))"; color = .systemOrange
+        case .powering:
+            title = "🔌 \(pct) \(fmtW(s.systemW))"; color = .labelColor
+        }
+        statusItem.button?.attributedTitle = NSAttributedString(string: title, attributes: [
+            .foregroundColor: color,
+            .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
+        ])
+    }
+
+    @objc func togglePopover() {
+        guard let btn = statusItem.button else { return }
+        if popover.isShown { popover.performClose(nil) }
+        else {
+            popover.show(relativeTo: btn.bounds, of: btn, preferredEdge: .minY)
+            popover.contentViewController?.view.window?.makeKey()
+        }
+    }
+}
+
+let app = NSApplication.shared
+app.setActivationPolicy(.accessory)
+let delegate = AppDelegate()
+app.delegate = delegate
+app.run()

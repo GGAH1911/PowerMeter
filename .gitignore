@@ -1,0 +1,21 @@
+# macOS
+.DS_Store
+
+# Build output
+*.app
+PowerMeter/PowerMeter.app/
+
+# Distributable archives (attach to GitHub Releases instead)
+*.zip
+
+# Compiled probe binaries (sources kept)
+probe/reader
+probe/smc2
+probe/smc3
+probe/smcprobe
+probe/t
+
+# Misc build artifacts
+*.o
+icon_*.png
+*.iconset/
