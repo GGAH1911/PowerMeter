@@ -1,6 +1,7 @@
 import Cocoa
 import SwiftUI
 import IOKit
+import IOKit.ps
 import ServiceManagement
 
 // MARK: - Power reading
@@ -98,9 +99,10 @@ final class PowerModel: ObservableObject {
     @Published var macCondition: String = ""
 
     private var idleStreak = 0
-    private let idleThreshold = 3
+    private let idleThreshold = 8   // ~16s: longer than the adapter-power populate lag
     private var timer: Timer?
     private var healthTimer: Timer?
+    private var psSource: CFRunLoopSource?
     var onTick: (() -> Void)?
 
     var chargeW: Double { max(0, snap.batteryW) }
@@ -118,6 +120,24 @@ final class PowerModel: ObservableObject {
         timer = Timer.scheduledTimer(withTimeInterval: interval, repeats: true) { [weak self] _ in self?.tick() }
         sampleMacHealth()
         healthTimer = Timer.scheduledTimer(withTimeInterval: 60.0, repeats: true) { [weak self] _ in self?.sampleMacHealth() }
+
+        // Instant, event-driven refresh the moment AC is plugged/unplugged or charging state changes.
+        let ctx = Unmanaged.passUnretained(self).toOpaque()
+        if let src = IOPSNotificationCreateRunLoopSource({ context in
+            guard let context = context else { return }
+            Unmanaged<PowerModel>.fromOpaque(context).takeUnretainedValue().onPowerSourceChange()
+        }, ctx)?.takeRetainedValue() {
+            CFRunLoopAddSource(CFRunLoopGetMain(), src, .defaultMode)
+            psSource = src
+        }
+    }
+
+    // Fired by the OS on power-source changes. Re-read immediately, then a couple of
+    // quick follow-ups to catch the wattage fields as they populate.
+    private func onPowerSourceChange() {
+        tick()
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.tick() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.tick() }
     }
 
     // Read macOS's official "Maximum Capacity %" + Condition (smoothed Apple metric).
@@ -449,7 +469,11 @@ struct PowerFlowView: View {
         case .charging: return ("⚡ 충전 중", "어댑터가 맥과 배터리에 동시 공급")
         case .boost:    return ("🔌+🔋 동시 사용", "맥 소비 > 어댑터 · 배터리가 부족분 보충")
         case .powering: return ("🔌 어댑터 구동", "어댑터가 맥만 구동 · 배터리 유지")
-        case .idle:     return ("🔋 배터리 구동", "어댑터 연결됨이나 유휴 · 배터리가 공급")
+        case .idle:
+            if let lim = engine.limit, model.snap.soc >= lim {
+                return ("🔌 충전 상한 유지", "\(lim)% 도달 · 충전 보류 (어댑터 대기)")
+            }
+            return ("🔌 어댑터 유휴", "어댑터 연결됨 · 지금은 배터리가 맥 구동")
         case .battery:  return ("🔋 배터리 구동", "어댑터 없음 · 배터리가 맥에 공급")
         }
     }
@@ -530,7 +554,7 @@ struct PowerFlowView: View {
                 FlowCanvas(edges: edges)
                 NodeBox(emoji: "⚡", label: "어댑터",
                         value: s.external ? fmtW(s.adapterW) : "—",
-                        dim: (model.state == .battery || model.state == .idle))
+                        dim: (model.state == .battery))   // dim only when truly unplugged
                     .position(adapterC)
                 NodeBox(emoji: "💻", label: "맥 사용", value: fmtW(s.systemW), dim: false)
                     .position(macC)
@@ -792,15 +816,18 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         let title: String
         let color: NSColor
         let pct = "\(s.soc)%"
-        switch model.state {
-        case .battery, .idle:
-            title = "🔋 \(pct) \(fmtW(s.systemW))"; color = .systemOrange
-        case .charging:
-            title = "🔌 \(pct) \(fmtW(s.systemW)) ＋\(fmtW(chargeW))"; color = .systemGreen
-        case .boost:
-            title = "🔌 \(pct) \(fmtW(s.systemW)) ▼\(fmtW(dischargeW))"; color = .systemOrange
-        case .powering:
-            title = "🔌 \(pct) \(fmtW(s.systemW))"; color = .labelColor
+        let sysW = fmtW(s.systemW)
+        // Icon is driven by ExternalConnected (updates instantly), NOT by the wattage
+        // fields (which lag ~15s). So plugging in flips to 🔌 immediately.
+        if !s.external {
+            title = "🔋 \(pct) \(sysW)"; color = .systemOrange
+        } else {
+            switch model.state {
+            case .charging: title = "🔌 \(pct) \(sysW) ＋\(fmtW(chargeW))"; color = .systemGreen
+            case .boost:    title = "🔌 \(pct) \(sysW) ▼\(fmtW(dischargeW))"; color = .systemOrange
+            case .idle:     title = "🔌 \(pct) \(sysW)"; color = .systemOrange
+            default:        title = "🔌 \(pct) \(sysW)"; color = .labelColor
+            }
         }
         statusItem.button?.attributedTitle = NSAttributedString(string: title, attributes: [
             .foregroundColor: color,
