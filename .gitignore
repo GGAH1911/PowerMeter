@@ -19,3 +19,6 @@ probe/t
 *.o
 icon_*.png
 *.iconset/
+
+# 내부 개발 문서 (로컬 전용)
+PowerMeter/ROADMAP.md

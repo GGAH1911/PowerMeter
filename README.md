@@ -78,7 +78,6 @@ PowerMeter/
   build.sh             # swiftc → .app 번들 빌드
   AppIcon.icns         # 앱 아이콘
   iconmaker.swift      # 아이콘 생성기 (CoreGraphics)
-  ROADMAP.md           # 기능 체크리스트
 probe/                 # IOKit/SMC 탐색 스크립트 (개발 기록)
 CHANGELOG.md           # 버전별 변경 이력
 ```
