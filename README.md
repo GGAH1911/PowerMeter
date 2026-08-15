@@ -53,13 +53,22 @@ open /Applications/PowerMeter.app
 
 충전 상한·방전·캘리브레이션은 검증된 오픈소스 [`battery`](https://github.com/actuallymentor/battery) 엔진에 위임합니다 (직접 SMC를 건드리지 않음).
 
+**충전 탭의 "엔진 설치" 버튼**을 누르면 관리자 인증 한 번으로 설치됩니다. 터미널을 열 필요가 없고, 실행될 명령과 설치될 경로를 승인 전에 그대로 보여줍니다.
+
+터미널을 선호하면 공식 스크립트를 직접 실행해도 됩니다:
 ```bash
 curl -s https://raw.githubusercontent.com/actuallymentor/battery/main/setup.sh | bash
 ```
 
-> ⚠️ 기존 충전 제한 앱(AlDente 등)이 있으면 **먼저 제거**하세요. 두 앱이 같은 SMC 충전 키를 두고 충돌합니다.
+> ⚠️ 기존 충전 제한 앱(AlDente 등)이 있으면 **먼저 제거**하세요. 두 앱이 같은 SMC 충전 키를 두고 충돌합니다. PowerMeter가 설치 전에 감지해서 경고합니다.
 
-설치되면 PowerMeter가 자동 감지하여 "충전 제어" 탭이 활성화됩니다.
+### 제거
+
+충전 탭 하단의 **"엔진 제거"** 버튼이 `battery uninstall`을 호출해 전부 되돌립니다 — 실행 파일, `/etc/sudoers.d/battery`, `/etc/paths.d/50-battery`, 백그라운드 데몬, `~/.battery` 설정. 충전 제한도 해제되어 정상 충전으로 돌아갑니다.
+
+> `brew uninstall --cask battery`는 `/usr/local/bin/smc` 심볼릭 링크만 지우고 **sudoers 규칙과 데몬은 남깁니다.** root 소유 항목까지 완전히 지우려면 위 버튼(또는 `battery uninstall`)을 쓰세요.
+
+PowerMeter 자체는 root 권한이 필요 없습니다. 전력·건강 데이터는 전부 무권한 IOKit으로 읽으며, 위 설치/제거만 인증을 요구합니다.
 
 ## 구조
 

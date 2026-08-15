@@ -262,6 +262,8 @@ final class BatteryEngine: ObservableObject {
     @Published var limit: Int? = nil          // nil = no limit (충전 제한 끔)
     @Published var sailing: Bool = UserDefaults.standard.bool(forKey: "sailing")
     @Published var lastCalibration: Date? = UserDefaults.standard.object(forKey: "lastCalibration") as? Date
+    @Published var busy = false               // a privileged install/uninstall is running
+    @Published var lastMessage: String? = nil
     private let home = NSHomeDirectory()
     private var binPath: String?
 
@@ -344,6 +346,77 @@ final class BatteryEngine: ObservableObject {
         let now = Date()
         lastCalibration = now
         UserDefaults.standard.set(now, forKey: "lastCalibration")
+    }
+
+    // MARK: Privileged install / uninstall
+    //
+    // Both delegate to the upstream tool rather than writing the sudoers file or
+    // deleting root-owned paths ourselves — `battery uninstall` also re-enables
+    // charging and unloads its daemon, which hand-deleting would skip.
+
+    static let setupURL = "https://raw.githubusercontent.com/actuallymentor/battery/main/setup.sh"
+
+    // setup.sh aborts when it resolves the calling user to root, but accepts the
+    // unprivileged account as $1 — required since we run the whole thing as root.
+    var installCommand: String {
+        "set -e; t=$(mktemp -d); curl -fsSL \(Self.setupURL) -o \"$t/setup.sh\"; "
+        + "/bin/bash \"$t/setup.sh\" '\(NSUserName())'; rm -rf \"$t\""
+    }
+
+    // battery derives configfolder and its LaunchAgent path from $HOME, so as bare
+    // root it would clean /var/root and leave the real account's daemon running.
+    var uninstallCommand: String {
+        "HOME='\(home)' SUDO_USER='\(NSUserName())' "
+        + "'\(binPath ?? "/usr/local/bin/battery")' uninstall silent"
+    }
+
+    // Two charge limiters fighting over the same SMC keys is the classic failure
+    // mode, so surface it before installing rather than after.
+    var conflictingApp: String? {
+        let known = [("/Applications/AlDente.app", "AlDente"),
+                     ("/Applications/battery.app", "Battery.app")]
+        return known.first { FileManager.default.fileExists(atPath: $0.0) }?.1
+    }
+
+    func install()   { runPrivileged(installCommand,   action: "설치") }
+    func uninstall() { runPrivileged(uninstallCommand, action: "제거") }
+
+    private func runPrivileged(_ command: String, action: String) {
+        guard !busy else { return }
+        busy = true
+        lastMessage = nil
+        DispatchQueue.global().async {
+            // AppleScript string literal: backslashes first, then quotes.
+            let esc = command
+                .replacingOccurrences(of: "\\", with: "\\\\")
+                .replacingOccurrences(of: "\"", with: "\\\"")
+            let p = Process()
+            p.executableURL = URL(fileURLWithPath: "/usr/bin/osascript")
+            p.arguments = ["-e", "do shell script \"\(esc)\" with administrator privileges"]
+            let errPipe = Pipe()
+            p.standardOutput = FileHandle.nullDevice   // install log is large; only errors matter
+            p.standardError = errPipe
+            var msg: String
+            do {
+                try p.run()
+                let err = String(data: errPipe.fileHandleForReading.readDataToEndOfFile(), encoding: .utf8) ?? ""
+                p.waitUntilExit()
+                if p.terminationStatus == 0 {
+                    msg = "\(action) 완료"
+                } else if err.contains("User canceled") || err.contains("-128") {
+                    msg = "취소됨"
+                } else {
+                    msg = "\(action) 실패 — \(err.trimmingCharacters(in: .whitespacesAndNewlines))"
+                }
+            } catch {
+                msg = "\(action) 실행 불가 — \(error.localizedDescription)"
+            }
+            DispatchQueue.main.async {
+                self.busy = false
+                self.lastMessage = msg
+                self.refresh()
+            }
+        }
     }
 }
 
@@ -477,6 +550,8 @@ struct PowerFlowView: View {
     @State private var sliderVal: Double = 80
     @State private var confirmDischarge = false
     @State private var confirmCalibrate = false
+    @State private var confirmInstall = false
+    @State private var confirmUninstall = false
     @AppStorage("refreshInterval") private var refreshInterval: Double = 2.0
     @AppStorage("showDecimals") private var showDecimals: Bool = true
     @AppStorage("menuBarMode") private var menuBarMode: Int = MenuBarMode.full.rawValue
@@ -702,7 +777,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.1  ·  IOKit + battery 엔진")
+            Text("PowerMeter 1.2  ·  IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
@@ -780,15 +855,37 @@ struct PowerFlowView: View {
                     Text(calibrationText).font(.system(size: 10)).foregroundColor(.white.opacity(0.6))
                 }
             } else {
-                VStack(alignment: .leading, spacing: 6) {
+                VStack(alignment: .leading, spacing: 8) {
                     Text("충전 제한 엔진(battery)이 설치되지 않았습니다.")
                         .font(.system(size: 11)).foregroundColor(.orange)
-                    Text("battery 엔진을 설치하면 이 탭에서\n충전 상한·방전·캘리브레이션을 제어합니다.")
+                    Text("설치하면 이 탭에서 충전 상한·방전·캘리브레이션을 제어합니다.\n관리자 인증 한 번으로 진행되며, 실행할 명령은 누르면 먼저 보여줍니다.")
                         .font(.system(size: 10)).foregroundColor(.white.opacity(0.45))
+                    if let c = engine.conflictingApp {
+                        Text("⚠️ \(c)이(가) 설치돼 있습니다. 같은 SMC 키를 두고 충돌하므로 먼저 제거하세요.")
+                            .font(.system(size: 10)).foregroundColor(.orange)
+                    }
+                    ActionButton(label: engine.busy ? "설치 중…" : "엔진 설치",
+                                 color: engine.busy ? Color(white: 0.35) : .green) {
+                        if !engine.busy { confirmInstall = true }
+                    }
+                    if let m = engine.lastMessage {
+                        Text(m).font(.system(size: 10))
+                            .foregroundColor(m.hasSuffix("완료") ? .green : .orange)
+                            .fixedSize(horizontal: false, vertical: true)
+                    }
                 }
                 .frame(maxWidth: .infinity, alignment: .leading)
             }
             Spacer(minLength: 0)
+            if engine.installed {
+                HStack {
+                    Spacer()
+                    Button(action: { if !engine.busy { confirmUninstall = true } }) {
+                        Text(engine.busy ? "제거 중…" : "엔진 제거")
+                            .font(.system(size: 10)).foregroundColor(.white.opacity(0.4))
+                    }.buttonStyle(.plain)
+                }
+            }
         }
         .padding(.horizontal, 16).padding(.top, 10)
         .onAppear { if let l = engine.limit { sliderVal = Double(l) } }
@@ -806,6 +903,37 @@ struct PowerFlowView: View {
             Button("시작", role: .destructive) { engine.calibrate() }
         } message: {
             Text("15%까지 방전 → 100% 충전 → 1시간 유지 → 80% 방전. 수 시간 걸리며 그동안 충전 제한이 해제됩니다.")
+        }
+        .alert("충전 제어 엔진 설치", isPresented: $confirmInstall) {
+            Button("취소", role: .cancel) {}
+            Button("설치") { engine.install() }
+        } message: {
+            Text("""
+                 오픈소스 battery 엔진(actuallymentor/battery)의 공식 설치 스크립트를 관리자 권한으로 실행합니다.
+
+                 설치되는 항목:
+                 • /usr/local/co.palokaj.battery/ — battery·smc 실행 파일 (root 소유)
+                 • /etc/sudoers.d/battery — 암호 없이 smc 실행을 허용하는 규칙
+                 • /etc/paths.d/50-battery, /usr/local/bin 심볼릭 링크
+
+                 실행할 명령:
+                 \(engine.installCommand)
+
+                 나중에 '엔진 제거'를 누르면 sudoers 규칙까지 모두 되돌립니다.
+                 """)
+        }
+        .alert("충전 제어 엔진 제거", isPresented: $confirmUninstall) {
+            Button("취소", role: .cancel) {}
+            Button("제거", role: .destructive) { engine.uninstall() }
+        } message: {
+            Text("""
+                 battery 엔진을 완전히 제거합니다. 충전 제한이 해제되고 정상 충전으로 돌아갑니다.
+
+                 제거되는 항목: 실행 파일, /etc/sudoers.d/battery, /etc/paths.d/50-battery, 백그라운드 데몬, ~/.battery 설정
+
+                 실행할 명령:
+                 \(engine.uninstallCommand)
+                 """)
         }
     }
 
