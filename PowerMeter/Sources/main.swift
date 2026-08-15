@@ -486,19 +486,24 @@ struct FlowCanvas: View {
     }
 }
 
-struct LimitChip: View {
+// Selectable chip. The stock segmented picker renders unselected segments nearly
+// invisible against this dark background, so choices use this instead.
+struct ChoiceChip: View {
     let label: String
     let active: Bool
     let action: () -> Void
+    var minWidth: CGFloat = 30
     var body: some View {
         Button(action: action) {
             Text(label)
                 .font(.system(size: 11, weight: active ? .semibold : .regular))
-                .foregroundColor(active ? .white : .white.opacity(0.7))
-                .frame(minWidth: 30)
+                .foregroundColor(active ? .white : .white.opacity(0.75))
+                .frame(minWidth: minWidth)
                 .padding(.vertical, 5).padding(.horizontal, 9)
                 .background(RoundedRectangle(cornerRadius: 8)
-                    .fill(active ? Color.green.opacity(0.85) : Color(white: 0.2)))
+                    .fill(active ? Color.green.opacity(0.85) : Color(white: 0.26)))
+                .overlay(RoundedRectangle(cornerRadius: 8)
+                    .stroke(active ? Color.clear : Color(white: 0.42), lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
@@ -555,6 +560,7 @@ struct PowerFlowView: View {
     @AppStorage("refreshInterval") private var refreshInterval: Double = 2.0
     @AppStorage("showDecimals") private var showDecimals: Bool = true
     @AppStorage("menuBarMode") private var menuBarMode: Int = MenuBarMode.full.rawValue
+    @State private var draftMode: Int = MenuBarMode.current.rawValue   // pending, applied on 확인
 
     // node centers
     let adapterC = CGPoint(x: 94, y: 54)
@@ -732,38 +738,54 @@ struct PowerFlowView: View {
 
     // MARK: Tab 4 — settings
     var settingsTab: some View {
-        VStack(alignment: .leading, spacing: 16) {
-            VStack(alignment: .leading, spacing: 5) {
-                HStack {
-                    Text("메뉴바 표시").font(.system(size: 12)).foregroundColor(.white.opacity(0.8))
-                    Spacer()
-                    Picker("", selection: $menuBarMode) {
-                        Text("아이콘").tag(MenuBarMode.icon.rawValue)
-                        Text("잔량").tag(MenuBarMode.percent.rawValue)
-                        Text("전력").tag(MenuBarMode.watts.rawValue)
-                        Text("전체").tag(MenuBarMode.full.rawValue)
-                    }
-                    .pickerStyle(.segmented).frame(width: 196).labelsHidden()
-                    .onChange(of: menuBarMode) { _ in model.onTick?() }
-                }
+        VStack(alignment: .leading, spacing: 14) {
+            VStack(alignment: .leading, spacing: 6) {
+                Text("메뉴바 표시").font(.system(size: 12)).foregroundColor(.white.opacity(0.8))
                 HStack(spacing: 6) {
-                    Text("미리보기").font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
-                    Text(model.menuBarTitle(MenuBarMode(rawValue: menuBarMode) ?? .full))
+                    ChoiceChip(label: "아이콘", active: draftMode == MenuBarMode.icon.rawValue,
+                               action: { draftMode = MenuBarMode.icon.rawValue }, minWidth: 40)
+                    ChoiceChip(label: "잔량", active: draftMode == MenuBarMode.percent.rawValue,
+                               action: { draftMode = MenuBarMode.percent.rawValue }, minWidth: 40)
+                    ChoiceChip(label: "전력", active: draftMode == MenuBarMode.watts.rawValue,
+                               action: { draftMode = MenuBarMode.watts.rawValue }, minWidth: 40)
+                    ChoiceChip(label: "전체", active: draftMode == MenuBarMode.full.rawValue,
+                               action: { draftMode = MenuBarMode.full.rawValue }, minWidth: 40)
+                }
+                // The chips only move the draft; the menu bar changes on 확인.
+                HStack(spacing: 6) {
+                    Text(draftMode == menuBarMode ? "미리보기" : "미리보기 · 적용 안 됨")
+                        .font(.system(size: 9))
+                        .foregroundColor(draftMode == menuBarMode ? .white.opacity(0.35) : .orange.opacity(0.8))
+                    Text(model.menuBarTitle(MenuBarMode(rawValue: draftMode) ?? .full))
                         .font(.system(size: 11, weight: .medium)).monospacedDigit()
                         .foregroundColor(Color(nsColor: model.menuBarColor))
                         .padding(.vertical, 2).padding(.horizontal, 6)
-                        .background(RoundedRectangle(cornerRadius: 5).fill(Color(white: 0.2)))
+                        .background(RoundedRectangle(cornerRadius: 5).fill(Color(white: 0.22)))
+                    Spacer()
+                    if draftMode != menuBarMode {
+                        Button(action: { menuBarMode = draftMode; model.onTick?() }) {
+                            Text("확인").font(.system(size: 11, weight: .semibold))
+                                .foregroundColor(.white)
+                                .padding(.vertical, 4).padding(.horizontal, 12)
+                                .background(RoundedRectangle(cornerRadius: 7).fill(Color.green.opacity(0.85)))
+                        }.buttonStyle(.plain)
+                        Button(action: { draftMode = menuBarMode }) {
+                            Text("되돌리기").font(.system(size: 10)).foregroundColor(.white.opacity(0.45))
+                        }.buttonStyle(.plain)
+                    }
                 }
+                .frame(height: 22)
             }
 
             HStack {
                 Text("갱신 주기").font(.system(size: 12)).foregroundColor(.white.opacity(0.8))
                 Spacer()
-                Picker("", selection: $refreshInterval) {
-                    Text("1초").tag(1.0); Text("2초").tag(2.0); Text("5초").tag(5.0)
+                ForEach([1.0, 2.0, 5.0], id: \.self) { v in
+                    ChoiceChip(label: "\(Int(v))초", active: refreshInterval == v, action: {
+                        refreshInterval = v
+                        model.restartTimer()
+                    }, minWidth: 34)
                 }
-                .pickerStyle(.segmented).frame(width: 170).labelsHidden()
-                .onChange(of: refreshInterval) { _ in model.restartTimer() }
             }
             Toggle(isOn: $showDecimals) {
                 Text("전력 소수점 표시 (3.4W / 3W)").font(.system(size: 12)).foregroundColor(.white.opacity(0.85))
@@ -777,11 +799,12 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.2  ·  IOKit + battery 엔진")
+            Text("PowerMeter 1.3  ·  IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
         .padding(.horizontal, 16).padding(.top, 14)
+        .onAppear { draftMode = menuBarMode }   // reopening the popover discards an unconfirmed draft
     }
 
     // MARK: Tab 3 — charge control
@@ -822,9 +845,9 @@ struct PowerFlowView: View {
 
                 // presets
                 HStack(spacing: 6) {
-                    LimitChip(label: "끔", active: engine.limit == nil) { engine.setLimit(nil) }
+                    ChoiceChip(label: "끔", active: engine.limit == nil) { engine.setLimit(nil) }
                     ForEach([60, 70, 80, 90, 100], id: \.self) { p in
-                        LimitChip(label: "\(p)", active: engine.limit == p) { engine.setLimit(p) }
+                        ChoiceChip(label: "\(p)", active: engine.limit == p) { engine.setLimit(p) }
                     }
                 }
 
