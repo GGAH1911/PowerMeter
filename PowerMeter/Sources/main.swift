@@ -336,14 +336,20 @@ final class BatteryEngine: ObservableObject {
 
 struct NodeBox: View {
     let emoji: String, label: String, value: String, dim: Bool
+    var sub: String? = nil
+    var subColor: Color = .white.opacity(0.5)
     var body: some View {
-        VStack(spacing: 2) {
+        VStack(spacing: 1) {
             HStack(spacing: 5) {
-                Text(emoji).font(.system(size: 17))
+                Text(emoji).font(.system(size: 16))
                 Text(label).font(.system(size: 11, weight: .medium)).foregroundColor(.white.opacity(0.55))
             }
-            Text(value).font(.system(size: 16, weight: .bold)).foregroundColor(.white)
+            Text(value).font(.system(size: 15, weight: .bold)).foregroundColor(.white)
                 .monospacedDigit()
+            if let sub = sub {
+                Text(sub).font(.system(size: 9, weight: .medium)).foregroundColor(subColor)
+                    .monospacedDigit()
+            }
         }
         .frame(width: 112, height: 58)
         .background(RoundedRectangle(cornerRadius: 14).fill(Color(white: 0.18)))
@@ -556,7 +562,9 @@ struct PowerFlowView: View {
                         value: s.external ? fmtW(s.adapterW) : "—",
                         dim: (model.state == .battery))   // dim only when truly unplugged
                     .position(adapterC)
-                NodeBox(emoji: "💻", label: "맥 사용", value: fmtW(s.systemW), dim: false)
+                NodeBox(emoji: "💻", label: "맥 사용", value: fmtW(s.systemW), dim: false,
+                        sub: s.tempC > 0 ? String(format: "🌡 %.1f°C", s.tempC) : nil,
+                        subColor: s.tempC >= 35 ? .orange : .white.opacity(0.5))
                     .position(macC)
                 NodeBox(emoji: "🔋", label: "배터리", value: "\(s.soc)%\(battArrow)", dim: false)
                     .position(battC)
