@@ -201,6 +201,21 @@ func fmtW(_ w: Double) -> String {
     return dec ? String(format: "%.1fW", w) : String(format: "%.0fW", w)
 }
 
+// MARK: - Menu bar width
+
+// How much the status item shows. `full` is raw value 0 so an unset default keeps
+// the original behavior.
+enum MenuBarMode: Int {
+    case full = 0      // 🔌 29% 8.4W ＋18.3W
+    case percent = 1   // 🔌 29%
+    case watts = 2     // 🔌 8.4W
+    case icon = 3      // 🔌
+
+    static var current: MenuBarMode {
+        MenuBarMode(rawValue: UserDefaults.standard.integer(forKey: "menuBarMode")) ?? .full
+    }
+}
+
 // MARK: - Top energy apps (no-sudo CPU proxy for Activity-Monitor-style "energy" list)
 
 struct AppCPU: Identifiable { let id = UUID(); let name: String; let cpu: Double }
@@ -464,6 +479,7 @@ struct PowerFlowView: View {
     @State private var confirmCalibrate = false
     @AppStorage("refreshInterval") private var refreshInterval: Double = 2.0
     @AppStorage("showDecimals") private var showDecimals: Bool = true
+    @AppStorage("menuBarMode") private var menuBarMode: Int = MenuBarMode.full.rawValue
 
     // node centers
     let adapterC = CGPoint(x: 94, y: 54)
@@ -642,6 +658,29 @@ struct PowerFlowView: View {
     // MARK: Tab 4 — settings
     var settingsTab: some View {
         VStack(alignment: .leading, spacing: 16) {
+            VStack(alignment: .leading, spacing: 5) {
+                HStack {
+                    Text("메뉴바 표시").font(.system(size: 12)).foregroundColor(.white.opacity(0.8))
+                    Spacer()
+                    Picker("", selection: $menuBarMode) {
+                        Text("아이콘").tag(MenuBarMode.icon.rawValue)
+                        Text("잔량").tag(MenuBarMode.percent.rawValue)
+                        Text("전력").tag(MenuBarMode.watts.rawValue)
+                        Text("전체").tag(MenuBarMode.full.rawValue)
+                    }
+                    .pickerStyle(.segmented).frame(width: 196).labelsHidden()
+                    .onChange(of: menuBarMode) { _ in model.onTick?() }
+                }
+                HStack(spacing: 6) {
+                    Text("미리보기").font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
+                    Text(model.menuBarTitle(MenuBarMode(rawValue: menuBarMode) ?? .full))
+                        .font(.system(size: 11, weight: .medium)).monospacedDigit()
+                        .foregroundColor(Color(nsColor: model.menuBarColor))
+                        .padding(.vertical, 2).padding(.horizontal, 6)
+                        .background(RoundedRectangle(cornerRadius: 5).fill(Color(white: 0.2)))
+                }
+            }
+
             HStack {
                 Text("갱신 주기").font(.system(size: 12)).foregroundColor(.white.opacity(0.8))
                 Spacer()
@@ -663,7 +702,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.0  ·  IOKit + battery 엔진")
+            Text("PowerMeter 1.1  ·  IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
@@ -786,6 +825,36 @@ extension PowerModel {
         guard m > 0 && m < 60 * 48 else { return "" }
         return (state == .charging ? "완충까지 " : "남은 시간 ") + String(format: "%d:%02d", m/60, m%60)
     }
+
+    // Menu bar string for a given width mode. Shared by the status item and the
+    // settings preview so the two never drift apart.
+    // Icon is driven by ExternalConnected (updates instantly), NOT by the wattage
+    // fields (which lag ~15s). So plugging in flips to 🔌 immediately.
+    func menuBarTitle(_ mode: MenuBarMode) -> String {
+        let icon = snap.external ? "🔌" : "🔋"
+        switch mode {
+        case .icon:    return icon
+        case .percent: return "\(icon) \(snap.soc)%"
+        case .watts:   return "\(icon) \(fmtW(snap.systemW))"
+        case .full:
+            let flow: String
+            switch state {
+            case .charging: flow = " ＋\(fmtW(chargeW))"
+            case .boost:    flow = " ▼\(fmtW(dischargeW))"
+            default:        flow = ""
+            }
+            return "\(icon) \(snap.soc)% \(fmtW(snap.systemW))\(flow)"
+        }
+    }
+
+    var menuBarColor: NSColor {
+        guard snap.external else { return .systemOrange }
+        switch state {
+        case .charging:     return .systemGreen
+        case .boost, .idle: return .systemOrange
+        default:            return .labelColor
+        }
+    }
 }
 
 // MARK: - App
@@ -818,27 +887,9 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     }
 
     func updateTitle() {
-        let s = model.snap
-        let chargeW = max(0, s.batteryW)
-        let dischargeW = max(0, -s.batteryW)
-        let title: String
-        let color: NSColor
-        let pct = "\(s.soc)%"
-        let sysW = fmtW(s.systemW)
-        // Icon is driven by ExternalConnected (updates instantly), NOT by the wattage
-        // fields (which lag ~15s). So plugging in flips to 🔌 immediately.
-        if !s.external {
-            title = "🔋 \(pct) \(sysW)"; color = .systemOrange
-        } else {
-            switch model.state {
-            case .charging: title = "🔌 \(pct) \(sysW) ＋\(fmtW(chargeW))"; color = .systemGreen
-            case .boost:    title = "🔌 \(pct) \(sysW) ▼\(fmtW(dischargeW))"; color = .systemOrange
-            case .idle:     title = "🔌 \(pct) \(sysW)"; color = .systemOrange
-            default:        title = "🔌 \(pct) \(sysW)"; color = .labelColor
-            }
-        }
+        let title = model.menuBarTitle(MenuBarMode.current)
         statusItem.button?.attributedTitle = NSAttributedString(string: title, attributes: [
-            .foregroundColor: color,
+            .foregroundColor: model.menuBarColor,
             .font: NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
         ])
     }

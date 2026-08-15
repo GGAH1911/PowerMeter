@@ -14,6 +14,7 @@
   - 🔋 배터리 구동
 - **배터리 건강 대시보드** — macOS와 일치하는 건강%, 설계/최대 용량, 사이클, 온도, 어댑터 사양, 에너지 사용 상위 앱
 - **충전 제어** (AlDente 대체) — 충전 상한 슬라이더·프리셋, Sailing(범위 유지), 강제 방전/충전, 캘리브레이션
+- **메뉴바 폭 조절** — 아이콘만 / 잔량 / 전력 / 전체 4단계로 상태바 길이 선택 (미리보기 제공)
 - **설정** — 갱신 주기, 소수점 표시, 로그인 시 자동 시작
 
 전력·건강 데이터는 **권한 없이 IOKit**(`AppleSmartBattery`)만으로 읽습니다. 충전 제어만 별도 엔진이 필요합니다.
@@ -26,18 +27,25 @@
 
 ## 설치
 
-### 빌드해서 설치
+### Homebrew (권장)
+```bash
+brew install --cask ggah1911/tap/powermeter
+```
+ad-hoc 서명만 된 미공증 앱이라 cask가 설치 후 격리 속성을 자동 해제합니다.
+
+### 미리 빌드된 앱 (Releases)
+[Releases](https://github.com/GGAH1911/PowerMeter/releases)에서 zip을 받아:
+```bash
+unzip PowerMeter-v1.1-arm64.zip -d /Applications
+xattr -dr com.apple.quarantine /Applications/PowerMeter.app   # 미공증 앱 격리 해제
+open /Applications/PowerMeter.app
+```
+
+### 직접 빌드
 ```bash
 cd PowerMeter
 ./build.sh
 cp -R PowerMeter.app /Applications/
-open /Applications/PowerMeter.app
-```
-
-### 미리 빌드된 앱 (Releases)
-Releases에서 zip을 받아 압축 해제 후:
-```bash
-xattr -dr com.apple.quarantine /Applications/PowerMeter.app   # 미공증 앱 격리 해제
 open /Applications/PowerMeter.app
 ```
 
