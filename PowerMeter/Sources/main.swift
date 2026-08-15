@@ -30,8 +30,65 @@ struct PowerSnapshot {
 
     var live: Bool = false       // wattages came from SMC rather than the 60s IOKit snapshot
 
+    // PowerTelemetryData — what the adapter draws vs what reaches the Mac
+    var adapterInW: Double = 0   // SystemPowerIn: DC actually delivered
+    var adapterLossW: Double = 0 // AdapterEfficiencyLoss: burned converting from wall AC
+    var adapterInV: Double = 0
+    var adapterInA: Double = 0
+    // USB-PD profiles the adapter advertises, and which one was negotiated
+    var pdProfiles: [PDProfile] = []
+    var pdActiveIndex: Int = -1
+    // ChargerData
+    var notChargingReason: UInt64 = 0
+    var chargerInhibit: UInt64 = 0
+    var thermalLimitedSec: Int = 0
+    // Per-cell readings
+    var cellVoltages: [Double] = []  // V
+    var cellRa: [Int] = []           // internal resistance, unitless SMC scale
+
     var healthPct: Int { designCap > 0 ? Int((Double(rawMaxCap) / Double(designCap) * 100).rounded()) : 0 }
     var condition: String { healthPct >= 80 ? "정상" : (healthPct >= 60 ? "양호" : "서비스 권장") }
+
+    /// Wall draw estimate: what reaches the Mac plus what the adapter wastes.
+    var wallW: Double { adapterInW + adapterLossW }
+    var adapterEfficiency: Double? {
+        wallW > 0.1 ? adapterInW / wallW : nil
+    }
+    var activePD: PDProfile? { pdProfiles.first { $0.index == pdActiveIndex } }
+
+    /// Spread between the highest and lowest cell, in millivolts. Grows under load
+    /// as the cell with the highest internal resistance sags furthest, so it only
+    /// means much at rest.
+    var cellSpreadMV: Int? {
+        guard let hi = cellVoltages.max(), let lo = cellVoltages.min(), cellVoltages.count > 1 else { return nil }
+        return Int(((hi - lo) * 1000).rounded())
+    }
+
+    // Only bit 7 is confirmed: it is set exactly when the adapter is absent and clear
+    // when it is attached. Bit 55 was set in every state observed, charging or not, so
+    // it carries no information here. Undecoded bits are surfaced as raw hex rather
+    // than guessed at.
+    var notChargingText: String? {
+        guard external else { return nil }          // unplugged needs no explanation
+        if charging { return nil }
+        if thermalLimitedSec > 0 { return "온도 때문에 충전이 제한되고 있습니다" }
+        if chargerInhibit != 0 { return String(format: "충전기가 억제됨 (0x%llx)", chargerInhibit) }
+        let unknown = notChargingReason & ~((1 << 7) | (1 << 55))
+        if unknown != 0 { return String(format: "충전 보류 중 (사유 0x%llx)", unknown) }
+        return nil
+    }
+}
+
+struct PDProfile: Identifiable {
+    let index: Int
+    let volts: Double
+    let amps: Double
+    var id: Int { index }
+    var watts: Double { volts * amps }
+    var label: String {
+        let v = volts == volts.rounded() ? String(format: "%.0fV", volts) : String(format: "%.1fV", volts)
+        return "\(v)/\(String(format: "%.1fA", amps))"
+    }
 }
 
 // MARK: - SMC (live power)
@@ -159,6 +216,35 @@ enum PowerReader {
         s.tempC       = Double((p["Temperature"] as? Int) ?? 0) / 100.0
         s.serial      = (p["Serial"] as? String) ?? ""
         s.batteryVoltage = Double(voltage) / 1000.0
+
+        // Adapter conversion loss and true DC input. All mW / mV / mA.
+        if let pt = p["PowerTelemetryData"] as? [String: Any] {
+            s.adapterInW   = Double((pt["SystemPowerIn"] as? Int) ?? 0) / 1000.0
+            s.adapterLossW = Double((pt["AdapterEfficiencyLoss"] as? Int) ?? 0) / 1000.0
+            s.adapterInV   = Double((pt["SystemVoltageIn"] as? Int) ?? 0) / 1000.0
+            s.adapterInA   = Double((pt["SystemCurrentIn"] as? Int) ?? 0) / 1000.0
+        }
+        // USB-PD menu is only published while an adapter is attached.
+        if let raw = p["AppleRawAdapterDetails"] as? [[String: Any]], let ad = raw.first {
+            s.pdActiveIndex = (ad["UsbHvcHvcIndex"] as? Int) ?? -1
+            if let menu = ad["UsbHvcMenu"] as? [[String: Any]] {
+                s.pdProfiles = menu.compactMap { e in
+                    guard let i = e["Index"] as? Int,
+                          let mv = e["MaxVoltage"] as? Int,
+                          let ma = e["MaxCurrent"] as? Int else { return nil }
+                    return PDProfile(index: i, volts: Double(mv) / 1000.0, amps: Double(ma) / 1000.0)
+                }
+            }
+        }
+        if let cd = p["ChargerData"] as? [String: Any] {
+            s.notChargingReason = UInt64(bitPattern: Int64((cd["NotChargingReason"] as? Int) ?? 0))
+            s.chargerInhibit    = UInt64(bitPattern: Int64((cd["ChargerInhibitReason"] as? Int) ?? 0))
+            s.thermalLimitedSec = (cd["TimeChargingThermallyLimited"] as? Int) ?? 0
+        }
+        if let bd = p["BatteryData"] as? [String: Any] {
+            if let cv = bd["CellVoltage"] as? [Int] { s.cellVoltages = cv.map { Double($0) / 1000.0 } }
+            if let ra = bd["WeightedRa"] as? [Int] { s.cellRa = ra }
+        }
         s.valid = true
         return s
     }
@@ -787,8 +873,13 @@ struct PowerFlowView: View {
 
     // MARK: Tab 2 — health
     var healthTab: some View {
+        ScrollView { healthContent }
+    }
+
+    // Split out of healthTab so it can be rendered and inspected without a scroll view.
+    var healthContent: some View {
         let s = model.snap
-        return ScrollView {
+        return Group {
             VStack(spacing: 1) {
                 StatRow(label: "배터리 건강",
                         value: model.macHealthPct.map { "\($0)%  ·  \(model.macCondition.isEmpty ? s.condition : model.macCondition)" }
@@ -810,12 +901,57 @@ struct PowerFlowView: View {
                 if s.external {
                     StatRow(label: "  └ 전압 / 전류",
                             value: String(format: "%.1f V · %.2f A", s.adapterVoltage, s.adapterCurrent))
+                    if let pd = s.activePD {
+                        StatRow(label: "  └ 협상 프로파일",
+                                value: "\(pd.label)  (\(String(format: "%.0fW", pd.watts)))",
+                                accent: .green)
+                        if s.pdProfiles.count > 1 {
+                            HStack(spacing: 4) {
+                                Text("      제공 프로파일").font(.system(size: 10))
+                                    .foregroundColor(.white.opacity(0.4))
+                                Spacer()
+                                ForEach(s.pdProfiles) { p in
+                                    Text(p.label)
+                                        .font(.system(size: 9, weight: p.index == s.pdActiveIndex ? .bold : .regular))
+                                        .foregroundColor(p.index == s.pdActiveIndex ? .green : .white.opacity(0.4))
+                                        .padding(.vertical, 1).padding(.horizontal, 4)
+                                        .background(RoundedRectangle(cornerRadius: 4)
+                                            .fill(p.index == s.pdActiveIndex ? Color.green.opacity(0.15) : Color.clear))
+                                }
+                            }
+                            .padding(.vertical, 2)
+                        }
+                    }
+                    if s.adapterLossW > 0, let eff = s.adapterEfficiency {
+                        StatRow(label: "  └ 어댑터 손실",
+                                value: String(format: "%.2f W  ·  효율 %.1f%%", s.adapterLossW, eff * 100),
+                                accent: eff >= 0.9 ? .white : .orange)
+                        StatRow(label: "  └ 벽면 소비(추정)", value: String(format: "%.2f W", s.wallW))
+                    }
                     if !s.adapterDesc.isEmpty {
                         StatRow(label: "  └ 설명", value: s.adapterDesc)
                     }
                 }
                 if !s.serial.isEmpty {
                     StatRow(label: "직렬번호", value: s.serial)
+                }
+                if s.cellVoltages.count > 1 {
+                    Divider().background(Color(white: 0.25)).padding(.vertical, 4)
+                    StatRow(label: "배터리 셀", value: "\(s.cellVoltages.count)셀")
+                    StatRow(label: "  └ 셀 전압",
+                            value: s.cellVoltages.map { String(format: "%.3f", $0) }.joined(separator: " / ") + " V")
+                    if let spread = s.cellSpreadMV {
+                        StatRow(label: "  └ 셀 편차", value: "\(spread) mV",
+                                accent: spread >= 50 ? .orange : .green)
+                    }
+                    if s.cellRa.count == s.cellVoltages.count {
+                        StatRow(label: "  └ 내부 저항",
+                                value: s.cellRa.map(String.init).joined(separator: " / "))
+                    }
+                    Text("셀 편차는 부하가 걸리면 커집니다. 저항이 높은 셀이 더 많이 떨어지기 때문이며, 무부하일 때의 값이 노화 지표입니다.")
+                        .font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
+                        .fixedSize(horizontal: false, vertical: true)
+                        .padding(.top, 2)
                 }
                 Divider().background(Color(white: 0.25)).padding(.vertical, 4)
                 HStack {
@@ -842,6 +978,18 @@ struct PowerFlowView: View {
         let m = model.state == .charging ? model.snap.timeToFull : model.snap.timeToEmpty
         guard m > 0 && m < 60 * 48 else { return "—" }
         return String(format: "%d시간 %d분", m / 60, m % 60)
+    }
+
+    // Prefers what the app already knows for certain over the SMC bitfield, which is
+    // only partly decoded.
+    var chargeHoldReason: String? {
+        let s = model.snap
+        guard s.external, !s.charging else { return nil }
+        if let lim = engine.limit, s.soc >= lim {
+            return "충전 상한 \(lim)%에 도달해 엔진이 충전을 보류 중입니다."
+        }
+        if s.soc >= 100 { return "완충 상태입니다." }
+        return s.notChargingText
     }
 
     var calibrationText: String {
@@ -920,7 +1068,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.4  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.5  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
@@ -941,6 +1089,16 @@ struct PowerFlowView: View {
                         .foregroundColor(engine.limit == nil ? .white.opacity(0.5) : .green)
                 } else {
                     Text("엔진 미설치").font(.system(size: 12)).foregroundColor(.orange)
+                }
+            }
+
+            // Why the adapter is attached but nothing is going into the battery.
+            if let why = chargeHoldReason {
+                HStack(spacing: 5) {
+                    Text("ⓘ").font(.system(size: 10)).foregroundColor(.white.opacity(0.5))
+                    Text(why).font(.system(size: 10)).foregroundColor(.white.opacity(0.6))
+                        .fixedSize(horizontal: false, vertical: true)
+                    Spacer()
                 }
             }
 
