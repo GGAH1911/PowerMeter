@@ -4,6 +4,13 @@
 
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고, 버전은 [유의적 버전](https://semver.org/lang/ko/)을 따릅니다.
 
+## [1.5.1] — 2026-08-16
+
+### 수정
+- **SMC 키가 일부만 존재할 때 어댑터 전력을 0으로 잘못 보고하던 문제.** 시스템 전력(`PSTR`)은 읽히는데 어댑터 전력(`PDTR`)이 없는 기기에서, 어댑터 전력이 조용히 0이 되어 실제로는 충전 중인데도 "어댑터 유휴"로 표시될 수 있었습니다. 이제 두 키가 모두 읽혀야만 SMC 값을 쓰고, 하나라도 없으면 IOKit 값으로 폴백합니다. 낡은 값을 보여주는 것이 틀린 값을 확신 있게 보여주는 것보다 낫기 때문입니다.
+
+현재 하드웨어에서는 발현되지 않는 잠재 버그입니다. SMC 인터페이스에서 실제로 변하는 부분이 프로토콜이 아니라 키 이름이라, 새 칩 세대에서 의미가 있습니다.
+
 ## [1.5] — 2026-08-16
 
 ### 추가
@@ -61,6 +68,7 @@ SMC 접근에는 관리자 권한이 필요 없으며, battery 엔진 설치 여
 - 흐름 탭의 맥 노드에 배터리 온도 표시 (35°C 이상 주황색)
 - 어댑터 연결·해제 시 즉시 반응하는 메뉴바 아이콘
 
+[1.5.1]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.5.1
 [1.5]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.5
 [1.4]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.4
 [1.3]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.3
