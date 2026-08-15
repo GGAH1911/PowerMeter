@@ -28,8 +28,92 @@ struct PowerSnapshot {
     var adapterDesc: String = ""
     var batteryVoltage: Double = 0  // V
 
+    var live: Bool = false       // wattages came from SMC rather than the 60s IOKit snapshot
+
     var healthPct: Int { designCap > 0 ? Int((Double(rawMaxCap) / Double(designCap) * 100).rounded()) : 0 }
     var condition: String { healthPct >= 80 ? "정상" : (healthPct >= 60 ? "양호" : "서비스 권장") }
+}
+
+// MARK: - SMC (live power)
+//
+// AppleSmartBattery only republishes every 60s — its UpdateTime advances in exact
+// 60s steps and every field, wattages included, is byte-identical in between. The
+// SMC keys behind those fields update continuously, and reading them needs no
+// privileges. PSTR and PDTR were confirmed against IOKit by catching the moment it
+// refreshes: both matched SystemPower and AdapterPower to three decimals.
+//
+// SMCKeyData_t is 80 bytes under C alignment, which Swift's struct layout does not
+// reproduce, so requests are built as raw buffers at explicit offsets.
+final class SMCReader {
+    private enum Off {
+        static let key = 0, dataSize = 28, dataType = 32, result = 40, data8 = 42, bytes = 48
+        static let total = 80
+    }
+    private static let cmdReadBytes: UInt8 = 5
+    private static let cmdReadKeyInfo: UInt8 = 9
+    private static let kernelIndex: UInt32 = 2
+    private static let floatType = fourCC("flt ")
+
+    private var conn: io_connect_t = 0
+    private(set) var available = false
+
+    init() {
+        let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
+        guard svc != 0 else { return }
+        defer { IOObjectRelease(svc) }
+        available = IOServiceOpen(svc, mach_task_self_, 0, &conn) == KERN_SUCCESS
+    }
+    deinit { if available { IOServiceClose(conn) } }
+
+    private static func fourCC(_ s: String) -> UInt32 {
+        var r: UInt32 = 0
+        for c in s.utf8 { r = (r << 8) + UInt32(c) }
+        return r
+    }
+    private func put32(_ b: inout [UInt8], _ off: Int, _ v: UInt32) {
+        withUnsafeBytes(of: v) { for i in 0..<4 { b[off + i] = $0[i] } }
+    }
+    private func get32(_ b: [UInt8], _ off: Int) -> UInt32 {
+        b[off..<off+4].withUnsafeBytes { $0.loadUnaligned(as: UInt32.self) }
+    }
+
+    private func call(_ input: inout [UInt8]) -> [UInt8]? {
+        var output = [UInt8](repeating: 0, count: Off.total)
+        var outSize = Off.total
+        let kr = input.withUnsafeMutableBytes { ip in
+            output.withUnsafeMutableBytes { op in
+                IOConnectCallStructMethod(conn, Self.kernelIndex,
+                                          ip.baseAddress, Off.total,
+                                          op.baseAddress, &outSize)
+            }
+        }
+        guard kr == KERN_SUCCESS, output[Off.result] == 0 else { return nil }
+        return output
+    }
+
+    /// Reads a 4-byte `flt ` key. Returns nil if the key is absent or another type.
+    func readFloat(_ key: String) -> Double? {
+        guard available else { return nil }
+        var info = [UInt8](repeating: 0, count: Off.total)
+        put32(&info, Off.key, Self.fourCC(key))
+        info[Off.data8] = Self.cmdReadKeyInfo
+        guard let meta = call(&info) else { return nil }
+        let size = get32(meta, Off.dataSize)
+        guard get32(meta, Off.dataType) == Self.floatType, size >= 4 else { return nil }
+
+        var req = [UInt8](repeating: 0, count: Off.total)
+        put32(&req, Off.key, Self.fourCC(key))
+        put32(&req, Off.dataSize, size)
+        req[Off.data8] = Self.cmdReadBytes
+        guard let out = call(&req) else { return nil }
+        return Double(out[Off.bytes..<Off.bytes+4].withUnsafeBytes { $0.loadUnaligned(as: Float32.self) })
+    }
+
+    /// System draw and adapter supply, in watts.
+    func power() -> (system: Double, adapter: Double)? {
+        guard let s = readFloat("PSTR") else { return nil }
+        return (s, readFloat("PDTR") ?? 0)
+    }
 }
 
 enum PowerReader {
@@ -105,6 +189,15 @@ final class PowerModel: ObservableObject {
     private var psSource: CFRunLoopSource?
     var onTick: (() -> Void)?
 
+    private let smc = SMCReader()
+    // AppleSmartBattery republishes on a 60s cycle, so re-reading it every tick just
+    // rebuilds the same 67-key dictionary. Capacity, cycles and health come from this
+    // cached snapshot; only the wattages are refreshed per tick, from SMC.
+    private var slowSnap = PowerSnapshot()
+    private var lastSlowRead = Date.distantPast
+    private var forceSlowRead = true
+    private let slowInterval: TimeInterval = 55
+
     var chargeW: Double { max(0, snap.batteryW) }
     var dischargeW: Double { max(0, -snap.batteryW) }
 
@@ -135,9 +228,16 @@ final class PowerModel: ObservableObject {
     // Fired by the OS on power-source changes. Re-read immediately, then a couple of
     // quick follow-ups to catch the wattage fields as they populate.
     private func onPowerSourceChange() {
+        // Plug/unplug changes ExternalConnected and the adapter spec, so the cached
+        // IOKit snapshot has to be rebuilt rather than waited out.
+        forceSlowRead = true
         tick()
-        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in self?.tick() }
-        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in self?.tick() }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 0.4) { [weak self] in
+            self?.forceSlowRead = true; self?.tick()
+        }
+        DispatchQueue.main.asyncAfter(deadline: .now() + 1.2) { [weak self] in
+            self?.forceSlowRead = true; self?.tick()
+        }
     }
 
     // Read macOS's official "Maximum Capacity %" + Condition (smoothed Apple metric).
@@ -170,8 +270,22 @@ final class PowerModel: ObservableObject {
     }
 
     private func tick() {
-        let s = PowerReader.read()
+        if forceSlowRead || Date().timeIntervalSince(lastSlowRead) >= slowInterval {
+            let fresh = PowerReader.read()
+            if fresh.valid { slowSnap = fresh; lastSlowRead = Date(); forceSlowRead = false }
+        }
+        var s = slowSnap
         guard s.valid else { return }
+
+        // Live wattages override the snapshot's stale ones. Battery flow follows from
+        // the energy balance: what the adapter supplies minus what the system draws.
+        if let live = smc.power() {
+            s.systemW = live.system
+            s.adapterW = s.external ? live.adapter : 0
+            s.batteryW = s.adapterW - live.system
+            s.live = true
+        }
+
         let adapterActive = s.external && s.adapterW > 0.5
         let dis = max(0, -s.batteryW)
         let chg = max(0, s.batteryW)
@@ -777,15 +891,22 @@ struct PowerFlowView: View {
                 .frame(height: 22)
             }
 
-            HStack {
-                Text("갱신 주기").font(.system(size: 12)).foregroundColor(.white.opacity(0.8))
-                Spacer()
-                ForEach([1.0, 2.0, 5.0], id: \.self) { v in
-                    ChoiceChip(label: "\(Int(v))초", active: refreshInterval == v, action: {
-                        refreshInterval = v
-                        model.restartTimer()
-                    }, minWidth: 34)
+            VStack(alignment: .leading, spacing: 4) {
+                HStack {
+                    Text("갱신 주기").font(.system(size: 12)).foregroundColor(.white.opacity(0.8))
+                    Spacer()
+                    ForEach([1.0, 2.0, 5.0], id: \.self) { v in
+                        ChoiceChip(label: "\(Int(v))초", active: refreshInterval == v, action: {
+                            refreshInterval = v
+                            model.restartTimer()
+                        }, minWidth: 34)
+                    }
                 }
+                Text(model.snap.live
+                     ? "전력값은 SMC에서 실시간으로 읽습니다 · 용량·사이클은 60초 주기"
+                     : "SMC 사용 불가 — 전력값도 IOKit 60초 갱신값을 씁니다")
+                    .font(.system(size: 9))
+                    .foregroundColor(model.snap.live ? .white.opacity(0.35) : .orange.opacity(0.8))
             }
             Toggle(isOn: $showDecimals) {
                 Text("전력 소수점 표시 (3.4W / 3W)").font(.system(size: 12)).foregroundColor(.white.opacity(0.85))
@@ -799,7 +920,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.3  ·  IOKit + battery 엔진")
+            Text("PowerMeter 1.4  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }

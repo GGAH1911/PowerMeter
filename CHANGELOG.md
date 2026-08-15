@@ -4,6 +4,15 @@
 
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고, 버전은 [유의적 버전](https://semver.org/lang/ko/)을 따릅니다.
 
+## [1.4] — 2026-08-16
+
+### 변경
+- **전력값을 SMC에서 실시간으로 읽습니다.** 지금까지 쓰던 IOKit `AppleSmartBattery`는 **60초에 한 번만** 값을 갱신합니다 — `UpdateTime`이 정확히 60초 간격으로만 움직이고 그사이 모든 필드가 바이트 단위로 동일합니다. 즉 1초로 설정해도 같은 값을 59번 다시 읽을 뿐이었습니다. 이제 시스템 소비와 어댑터 공급은 SMC(`PSTR`/`PDTR`)에서 직접 읽어 매 틱 실제로 갱신되고, 배터리 흐름은 둘의 차이로 구합니다. **갱신 주기 설정이 비로소 실제 효과를 갖습니다.**
+- **IOKit 폴링을 60초로 낮췄습니다.** 용량·사이클·건강·어댑터 사양처럼 원래 느리게 변하는 값만 IOKit에서 읽습니다. 어댑터를 꽂거나 뽑으면 이벤트로 즉시 다시 읽으므로 반응성은 그대로입니다. 1초 설정 기준 분당 IOKit 조회가 60회에서 1회로 줄어, 전력 모니터가 전력을 덜 쓰게 됐습니다.
+- 설정 탭에 데이터 출처를 표시합니다. SMC를 못 여는 환경에서는 기존 IOKit 값으로 자동 폴백하고 그 사실을 알립니다.
+
+SMC 접근에는 관리자 권한이 필요 없으며, battery 엔진 설치 여부와도 무관합니다.
+
 ## [1.3] — 2026-08-15
 
 ### 변경
@@ -40,6 +49,7 @@
 - 흐름 탭의 맥 노드에 배터리 온도 표시 (35°C 이상 주황색)
 - 어댑터 연결·해제 시 즉시 반응하는 메뉴바 아이콘
 
+[1.4]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.4
 [1.3]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.3
 [1.2]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.2
 [1.1]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.1
