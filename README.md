@@ -80,7 +80,10 @@ PowerMeter/
   iconmaker.swift      # 아이콘 생성기 (CoreGraphics)
   ROADMAP.md           # 기능 체크리스트
 probe/                 # IOKit/SMC 탐색 스크립트 (개발 기록)
+CHANGELOG.md           # 버전별 변경 이력
 ```
+
+버전별 변경 내용은 [CHANGELOG.md](CHANGELOG.md), 다운로드는 [Releases](https://github.com/GGAH1911/PowerMeter/releases)에 있습니다.
 
 ## 크레딧 / 라이선스
 
