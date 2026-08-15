@@ -166,10 +166,13 @@ final class SMCReader {
         return Double(out[Off.bytes..<Off.bytes+4].withUnsafeBytes { $0.loadUnaligned(as: Float32.self) })
     }
 
-    /// System draw and adapter supply, in watts.
+    /// System draw and adapter supply, in watts. Nil unless *both* keys read, so a
+    /// machine that publishes only one degrades to the IOKit snapshot rather than
+    /// reporting a confident zero: a missing PDTR would otherwise look like an idle
+    /// adapter while the battery is actually charging.
     func power() -> (system: Double, adapter: Double)? {
-        guard let s = readFloat("PSTR") else { return nil }
-        return (s, readFloat("PDTR") ?? 0)
+        guard let system = readFloat("PSTR"), let adapter = readFloat("PDTR") else { return nil }
+        return (system, adapter)
     }
 }
 
