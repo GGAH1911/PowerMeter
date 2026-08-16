@@ -420,15 +420,26 @@ final class PowerModel: ObservableObject {
     // sooner; IOKit's own Temperature is a different point on the pack and sits ~4°C
     // lower. Reading one identified key keeps every tab on one number.
     @Published private(set) var batteryTempKey: String?
-    /// Hottest CPU-family sensor, tracked per tick so the flow diagram can label the
-    /// Mac node with the Mac's own temperature instead of the battery's.
+    /// Mean across the tracked CPU sensors. The hottest single core was the obvious
+    /// choice and the wrong one: a core wakes, spikes and sleeps within a tick, so the
+    /// maximum jumped up to 10°C between readings and the reported key changed with it.
+    /// Measured over the same eight sensors, the mean moves 1.33°C a tick against the
+    /// maximum's 3.39°C, and spans half the range — closer to what "CPU temperature"
+    /// should mean anyway.
     @Published private(set) var cpuTempC: Double = 0
-    @Published private(set) var cpuTempKey: String?
+    @Published private(set) var cpuSensorCount: Int = 0
 
     static func plausible(_ c: Double) -> Bool { c > 15 && c < 110 }
 
     private var tempKeys: [String] = []
     private var watchKeys: [String] = []
+    // A dedicated, stable set of CPU sensors. The general watch list is the six
+    // hottest overall, which on some machines holds only one CPU sensor — and when a
+    // single tick's reading of it was implausible the reported CPU temperature fell to
+    // whatever else was in the list. Taking the maximum over the same set every tick
+    // removes that jump; cores trading places no longer moves the number.
+    private var cpuWatchKeys: [String] = []
+    private let cpuWatchCount = 8
     // Keys whose value was bit-identical across two sweeps. A threshold constant never
     // moves: an M2 Max publishes Tf46 at a fixed 102.8°C through idle, full load and
     // cooldown alike, and it would otherwise headline as the hottest sensor in red.
@@ -560,9 +571,12 @@ final class PowerModel: ObservableObject {
             // that matches IOKit's VirtualTemperature, and averaging in the cooler
             // TB2T would produce a number no other source reports.
             let fans = self.smc.fanRPMs()
+            let cpuSet = readings.filter(\.isCPU).sorted { $0.c > $1.c }
+                .prefix(self.cpuWatchCount).map(\.key)
             DispatchQueue.main.async {
                 self.lastSweep = sampled
                 self.stuckCount = counts
+                if !cpuSet.isEmpty { self.cpuWatchKeys = cpuSet }
                 self.watchKeys = hottest
                 if let battKey { self.batteryTempKey = battKey }
                 self.fanRPMs = fans
@@ -626,15 +640,17 @@ final class PowerModel: ObservableObject {
                 guard let v = smc.readFloat(k), Self.plausible(v) else { return nil }
                 return TempReading(key: k, c: v)
             }
-            if !readings.isEmpty {
-                temps = readings.sorted { $0.c > $1.c }
-                // Take the CPU peak from this tick's readings rather than pinning the
-                // key the sweep picked: cores trade places between sweeps, and a pinned
-                // key reports a cooler core while a hotter one sits in the same list.
-                if let hottestCPU = temps.first(where: \.isCPU) {
-                    cpuTempC = hottestCPU.c
-                    cpuTempKey = hottestCPU.key
-                }
+            if !readings.isEmpty { temps = readings.sorted { $0.c > $1.c } }
+        }
+        // Mean across the fixed CPU set, read every tick.
+        if !cpuWatchKeys.isEmpty {
+            let vs = cpuWatchKeys.compactMap { k -> Double? in
+                guard let v = smc.readFloat(k), Self.plausible(v) else { return nil }
+                return v
+            }
+            if !vs.isEmpty {
+                cpuTempC = vs.reduce(0, +) / Double(vs.count)
+                cpuSensorCount = vs.count
             }
         }
         // Battery temperature comes from SMC when it can, so the flow, health and
@@ -1001,57 +1017,71 @@ struct Sparkline: View {
     }
 }
 
-/// One temperature series on its own scale. CPU and battery get separate charts:
-/// sharing an axis pinned the battery to a flat line at the bottom, which said
-/// nothing about the two degrees it does move.
+/// One temperature series on its own scale, over a fixed one-hour window.
 ///
-/// An hour of ticks is more samples than the view has pixels, so each column is
-/// averaged rather than overplotted — raw, every column drew its full spread and the
-/// trace read as a picket fence. The label still quotes the true min and max, so
-/// smoothing the line never hides the range.
+/// The x axis is always the full hour. Stretching however much has been collected
+/// across the whole width made twenty seconds of data look exactly like an hour of
+/// it; now a short history occupies the right edge and the rest stays empty, so how
+/// much you are actually looking at is visible.
+///
+/// An hour holds more samples than the view has pixels, so each column is averaged
+/// rather than overplotted — raw, every column drew its full spread and the trace
+/// read as a picket fence. The label quotes the true min and max, so a smoother line
+/// never hides the range.
 struct TempSeriesChart: View {
-    let values: [Double]
+    let samples: [TempSample]
+    let value: (TempSample) -> Double
     let color: Color
+    var window: TimeInterval = 3600
 
-    private var clean: [Double] { values.filter { $0 > 0 } }
+    private var clean: [Double] { samples.map(value).filter { $0 > 0 } }
 
     var range: (lo: Double, hi: Double)? {
         guard let lo = clean.min(), let hi = clean.max() else { return nil }
         return (lo, hi)
     }
-
     var label: String {
         guard let r = range else { return "" }
-        return String(format: "%.0f–%.0f°C", r.lo, r.hi)
+        return String(format: "%.0f\u{2013}%.0f\u{00B0}C", r.lo, r.hi)
     }
-
-    /// Mean per pixel column, so the line reads as a trend at any window length.
-    private func downsample(_ v: [Double], to width: Int) -> [Double] {
-        guard width > 0, v.count > width else { return v }
-        let bucket = Double(v.count) / Double(width)
-        return (0..<width).map { i in
-            let from = Int(Double(i) * bucket)
-            let to = min(v.count, max(from + 1, Int(Double(i + 1) * bucket)))
-            let slice = v[from..<to]
-            return slice.reduce(0, +) / Double(slice.count)
-        }
+    /// Share of the window that has been filled, so the trace starts where it should.
+    var filled: Double {
+        guard let first = samples.first, let last = samples.last else { return 0 }
+        return min(1, max(0, last.at.timeIntervalSince(first.at) / window))
     }
 
     var body: some View {
         Canvas { ctx, size in
-            let pts = downsample(clean, to: Int(size.width))
-            guard pts.count > 1, let r = range else { return }
-            let span = max(r.hi - r.lo, 3)      // never zoom into sensor noise
-            let dx = size.width / CGFloat(pts.count - 1)
-            var line = Path()
-            for (i, v) in pts.enumerated() {
-                let y = size.height - CGFloat((v - r.lo) / span) * (size.height - 4) - 2
-                let p = CGPoint(x: CGFloat(i) * dx, y: y)
-                if i == 0 { line.move(to: p) } else { line.addLine(to: p) }
+            guard samples.count > 1, let r = range, let last = samples.last else { return }
+            let span = max(r.hi - r.lo, 3)              // never zoom into sensor noise
+            let originX = size.width * (1 - CGFloat(filled))
+            let usable = max(1.0, size.width - originX)
+            let occupied = window * filled
+            let start = last.at.addingTimeInterval(-occupied)
+
+            // Average per pixel column across the occupied part of the axis.
+            let cols = max(1, Int(usable))
+            var sums = [Double](repeating: 0, count: cols)
+            var counts = [Int](repeating: 0, count: cols)
+            for s in samples {
+                let v = value(s)
+                guard v > 0 else { continue }
+                let f = occupied > 0 ? s.at.timeIntervalSince(start) / occupied : 1
+                let idx = min(cols - 1, max(0, Int(f * Double(cols - 1))))
+                sums[idx] += v; counts[idx] += 1
             }
+            var line = Path()
+            var started = false
+            for i in 0..<cols where counts[i] > 0 {
+                let v = sums[i] / Double(counts[i])
+                let y = size.height - CGFloat((v - r.lo) / span) * (size.height - 4) - 2
+                let p = CGPoint(x: originX + CGFloat(i), y: y)
+                if started { line.addLine(to: p) } else { line.move(to: p); started = true }
+            }
+            guard started else { return }
             var fill = line
             fill.addLine(to: CGPoint(x: size.width, y: size.height))
-            fill.addLine(to: CGPoint(x: 0, y: size.height))
+            fill.addLine(to: CGPoint(x: originX, y: size.height))
             fill.closeSubpath()
             ctx.fill(fill, with: .linearGradient(
                 Gradient(colors: [color.opacity(0.22), color.opacity(0.02)]),
@@ -1443,7 +1473,8 @@ struct PowerFlowView: View {
                     Text(model.cpuTempC > 0 ? String(format: "%.1f °C", model.cpuTempC) : "—")
                         .font(.system(size: 24, weight: .bold)).monospacedDigit()
                         .foregroundColor(tempColor(model.cpuTempC))
-                    Text(model.cpuTempKey ?? "").font(.system(size: 8))
+                    Text(model.cpuSensorCount > 0 ? "코어 \(model.cpuSensorCount)" : "")
+                        .font(.system(size: 8))
                         .foregroundColor(.white.opacity(0.25)).frame(width: 30, alignment: .leading)
                 }
                 HStack(alignment: .firstTextBaseline) {
@@ -1468,8 +1499,8 @@ struct PowerFlowView: View {
                 }
 
                 Divider().background(Color(white: 0.25)).padding(.top, 3)
-                let cpuChart = TempSeriesChart(values: model.tempHistory.map(\.cpu), color: TempPalette.cpu)
-                let battChart = TempSeriesChart(values: model.tempHistory.map(\.batt), color: TempPalette.batt)
+                let cpuChart = TempSeriesChart(samples: model.tempHistory, value: { $0.cpu }, color: TempPalette.cpu)
+                let battChart = TempSeriesChart(samples: model.tempHistory, value: { $0.batt }, color: TempPalette.batt)
                 if model.tempHistory.count > 1 {
                     VStack(alignment: .leading, spacing: 1) {
                         HStack {
@@ -1489,9 +1520,14 @@ struct PowerFlowView: View {
                         }
                         battChart.frame(height: 38)
                     }
-                    Text(model.tempHistorySpan).font(.system(size: 9))
-                        .foregroundColor(.white.opacity(0.3))
-                        .frame(maxWidth: .infinity, alignment: .trailing)
+                    HStack {
+                        Text("1시간 전").font(.system(size: 9)).foregroundColor(.white.opacity(0.28))
+                        Spacer()
+                        Text("기록 \(model.tempHistorySpan)").font(.system(size: 9))
+                            .foregroundColor(.white.opacity(0.28))
+                        Spacer()
+                        Text("지금").font(.system(size: 9)).foregroundColor(.white.opacity(0.28))
+                    }
                 } else {
                     Text("기록을 모으는 중…").font(.system(size: 10)).foregroundColor(.white.opacity(0.3))
                         .frame(maxWidth: .infinity, minHeight: 120)
@@ -1575,7 +1611,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.9  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.9.1  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
