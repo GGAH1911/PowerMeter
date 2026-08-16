@@ -1224,6 +1224,15 @@ struct PowerFlowView: View {
         return s.notChargingText
     }
 
+    // Apple Silicon die sensors sit in the 80–100°C band under sustained load and only
+    // throttle above it, so warning at 80 would flag ordinary work as trouble. The
+    // hottest sensor on a machine is usually a die sensor, which is what this colours.
+    func tempColor(_ c: Double) -> Color {
+        if c >= 100 { return .red }
+        if c >= 90 { return .orange }
+        return .white
+    }
+
     // MARK: Tab — temperature
     var tempTab: some View {
         VStack(alignment: .leading, spacing: 0) {
@@ -1237,7 +1246,7 @@ struct PowerFlowView: View {
                     if let m = model.maxTemp {
                         Text(String(format: "%.1f °C", m.c))
                             .font(.system(size: 22, weight: .bold)).monospacedDigit()
-                            .foregroundColor(m.c >= 80 ? .orange : (m.c >= 95 ? .red : .white))
+                            .foregroundColor(tempColor(m.c))
                         Text(m.key).font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                     }
                 }
@@ -1264,9 +1273,9 @@ struct PowerFlowView: View {
                 }
                 ForEach(model.temps) { t in
                     StatRow(label: "  \(t.key)", value: String(format: "%.1f °C", t.c),
-                            accent: t.c >= 80 ? .orange : .white)
+                            accent: tempColor(t.c))
                 }
-                Text("센서 키 이름은 Apple이 공개하지 않아 원문 그대로 표시합니다. 전체 센서를 훑어 가장 뜨거운 것들만 추적합니다.")
+                Text("센서 키 이름은 Apple이 공개하지 않고 같은 키가 칩 세대마다 다른 것을 가리키기도 해서, 이름을 붙이지 않고 원문 그대로 표시합니다. 가장 뜨거운 센서는 보통 다이 온도라 부하 중 80~100°C는 정상이며 그 위에서 스로틀링이 걸립니다.")
                     .font(.system(size: 9)).foregroundColor(.white.opacity(0.32))
                     .fixedSize(horizontal: false, vertical: true).padding(.top, 4)
             }
@@ -1348,7 +1357,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.6  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.6.1  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
