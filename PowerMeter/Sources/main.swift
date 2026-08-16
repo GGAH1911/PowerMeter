@@ -1521,10 +1521,6 @@ struct PowerFlowView: View {
                     Text(model.cpuTempC > 0 ? String(format: "%.1f °C", model.cpuTempC) : "—")
                         .font(.system(size: 24, weight: .bold)).monospacedDigit()
                         .foregroundColor(tempColor(model.cpuTempC))
-                    // Sensors, not cores: an M2 Max has 12 cores and 112 CPU sensors.
-                    Text(model.cpuSensorCount > 0 ? "센서 \(model.cpuSensorCount)" : "")
-                        .font(.system(size: 8))
-                        .foregroundColor(UI.text(0.25)).frame(width: 42, alignment: .leading)
                 }
                 HStack(alignment: .firstTextBaseline) {
                     Circle().fill(TempPalette.batt).frame(width: 7, height: 7)
@@ -1533,8 +1529,6 @@ struct PowerFlowView: View {
                     Text(model.snap.tempC > 0 ? String(format: "%.1f °C", model.snap.tempC) : "—")
                         .font(.system(size: 24, weight: .bold)).monospacedDigit()
                         .foregroundColor(model.snap.tempC >= 40 ? UI.warn : UI.textStrong)
-                    Text(model.batteryTempKey ?? "IOKit").font(.system(size: 8))
-                        .foregroundColor(UI.text(0.25)).frame(width: 30, alignment: .leading)
                 }
 
                 if model.fanRPMs.isEmpty {
@@ -1660,7 +1654,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 2.1.1  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 2.1.2  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(UI.text(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }

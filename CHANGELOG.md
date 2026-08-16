@@ -4,6 +4,11 @@
 
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고, 버전은 [유의적 버전](https://semver.org/lang/ko/)을 따릅니다.
 
+## [2.1.2] — 2026-08-16
+
+### 변경
+- 온도 탭에서 값 뒤에 흐리게 붙던 출처 표시(`센서 60`, `TB0T`)를 없앴습니다. 어떤 센서를 쓰는지는 릴리스 노트에 남아 있고, 화면에서는 잡음이었습니다.
+
 ## [2.1.1] — 2026-08-16
 
 ### 수정
@@ -224,6 +229,7 @@ SMC 접근에는 관리자 권한이 필요 없으며, battery 엔진 설치 여
 - 흐름 탭의 맥 노드에 배터리 온도 표시 (35°C 이상 주황색)
 - 어댑터 연결·해제 시 즉시 반응하는 메뉴바 아이콘
 
+[2.1.2]: https://github.com/GGAH1911/PowerMeter/releases/tag/v2.1.2
 [2.1.1]: https://github.com/GGAH1911/PowerMeter/releases/tag/v2.1.1
 [2.1]: https://github.com/GGAH1911/PowerMeter/releases/tag/v2.1
 [2.0]: https://github.com/GGAH1911/PowerMeter/releases/tag/v2.0
