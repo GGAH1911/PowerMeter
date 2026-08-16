@@ -410,8 +410,17 @@ final class PowerModel: ObservableObject {
     @Published private(set) var cpuTempC: Double = 0
     @Published private(set) var cpuTempKey: String?
 
+    static func plausible(_ c: Double) -> Bool { c > 15 && c < 110 }
+
     private var tempKeys: [String] = []
     private var watchKeys: [String] = []
+    // Unidentified keys whose value was bit-identical across two sweeps. A threshold
+    // constant never moves: an M2 Max publishes Tf46 at a fixed 102.8°C through idle,
+    // full load and cooldown alike, and it would otherwise headline as the hottest
+    // sensor in red. Only sensors whose family is unknown are eligible — a resting
+    // battery legitimately holds one value, and TB*/Tp*/Te* are identified.
+    private var lastSweep: [String: Double] = [:]
+    private var stuckKeys: Set<String> = []
     private let watchCount = 6
     private let historyCap = 300
 
@@ -485,10 +494,21 @@ final class PowerModel: ObservableObject {
             if self.tempKeys.isEmpty {
                 self.tempKeys = self.smc.allKeys().filter { $0.hasPrefix("T") }
             }
+            var sampled: [String: Double] = [:]
             var readings: [TempReading] = []
             for k in self.tempKeys {
-                if let v = self.smc.readFloat(k), v > 15, v < 110 { readings.append(TempReading(key: k, c: v)) }
+                guard let v = self.smc.readFloat(k), Self.plausible(v) else { continue }
+                sampled[k] = v
+                readings.append(TempReading(key: k, c: v))
             }
+            let previous = self.lastSweep
+            let newlyStuck = readings
+                .filter { $0.family == nil && previous[$0.key] == sampled[$0.key] }
+                .map(\.key)
+            let stuck = self.stuckKeys.union(newlyStuck)
+            // Battery is resolved from every reading; only ranking drops the stuck ones.
+            let battKey = readings.filter(\.isBattery).map(\.key).sorted().first
+            readings.removeAll { stuck.contains($0.key) }
             var hottest = readings.sorted { $0.c > $1.c }.prefix(self.watchCount).map(\.key)
             // Guarantee at least one CPU sensor is watched even if other parts run hotter,
             // so the CPU reading never goes blank.
@@ -499,9 +519,10 @@ final class PowerModel: ObservableObject {
             // Lowest-numbered TB sensor, not an average across them: TB0T is the one
             // that matches IOKit's VirtualTemperature, and averaging in the cooler
             // TB2T would produce a number no other source reports.
-            let battKey = readings.filter(\.isBattery).map(\.key).sorted().first
             let fans = self.smc.fanRPMs()
             DispatchQueue.main.async {
+                self.lastSweep = sampled
+                self.stuckKeys = stuck
                 self.watchKeys = hottest
                 if let battKey { self.batteryTempKey = battKey }
                 self.fanRPMs = fans
@@ -559,7 +580,12 @@ final class PowerModel: ObservableObject {
 
         // Poll only the hot set; the sweep that chooses it runs on the slow cycle.
         if !watchKeys.isEmpty {
-            let readings = watchKeys.compactMap { k in smc.readFloat(k).map { TempReading(key: k, c: $0) } }
+            // Same plausibility window as the sweep. A core that powers down reports
+            // nonsense — an M2 Max core read 8.4°C moments after its load stopped.
+            let readings = watchKeys.compactMap { k -> TempReading? in
+                guard let v = smc.readFloat(k), Self.plausible(v) else { return nil }
+                return TempReading(key: k, c: v)
+            }
             if !readings.isEmpty {
                 temps = readings.sorted { $0.c > $1.c }
                 // Take the CPU peak from this tick's readings rather than pinning the
@@ -1411,7 +1437,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.7  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.7.1  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
