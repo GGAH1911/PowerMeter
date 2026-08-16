@@ -1168,8 +1168,10 @@ struct TabButton: View {
     let title: String; let active: Bool; let action: () -> Void
     var body: some View {
         Button(action: action) {
+            // The active pill is white, not a filled accent, so its label has to be
+            // dark — white on white left the selected tab blank.
             Text(title).font(.system(size: 12, weight: active ? .semibold : .regular))
-                .foregroundColor(active ? .white : UI.text(0.5))
+                .foregroundColor(active ? UI.textStrong : UI.text(0.5))
                 .padding(.vertical, 6).frame(maxWidth: .infinity)
                 .background(active ? UI.tabActive : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
@@ -1646,7 +1648,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 2.0  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 2.1  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(UI.text(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
@@ -1893,6 +1895,91 @@ extension PowerModel {
     }
 }
 
+// MARK: - Window
+//
+// A panel rather than an NSPopover. A popover is tethered to the status item, and the
+// status item slides around whenever any other menu bar app changes width, so the
+// window opened somewhere different almost every time. This one remembers where it
+// was put and reopens there; drag it and the new spot is what it remembers.
+final class Panel {
+    private let panel: NSPanel
+    private var outsideMonitor: Any?
+    private var keyMonitor: Any?
+    private static let originKey = "panelOrigin"
+
+    var isVisible: Bool { panel.isVisible }
+
+    init(content: NSView, size: NSSize) {
+        panel = NSPanel(contentRect: NSRect(origin: .zero, size: size),
+                        styleMask: [.borderless, .nonactivatingPanel],
+                        backing: .buffered, defer: false)
+        panel.isFloatingPanel = true
+        panel.level = .statusBar
+        panel.hidesOnDeactivate = false
+        panel.isOpaque = false
+        panel.backgroundColor = .clear
+        panel.hasShadow = true
+        panel.isMovableByWindowBackground = true       // drag anywhere on the body
+        panel.appearance = NSAppearance(named: .aqua)
+        panel.collectionBehavior = [.canJoinAllSpaces, .fullScreenAuxiliary]
+
+        content.wantsLayer = true
+        content.layer?.cornerRadius = 12
+        content.layer?.masksToBounds = true
+        panel.contentView = content
+
+        NotificationCenter.default.addObserver(forName: NSWindow.didMoveNotification,
+                                               object: panel, queue: .main) { [weak self] _ in
+            self?.saveOrigin()
+        }
+    }
+
+    private func saveOrigin() {
+        let o = panel.frame.origin
+        UserDefaults.standard.set(["x": Double(o.x), "y": Double(o.y)], forKey: Self.originKey)
+    }
+
+    /// Saved spot if there is one, otherwise under the status item the first time.
+    private func placeIfNeeded(below button: NSStatusBarButton?) {
+        var origin: NSPoint? = nil
+        if let d = UserDefaults.standard.dictionary(forKey: Self.originKey),
+           let x = d["x"] as? Double, let y = d["y"] as? Double {
+            origin = NSPoint(x: x, y: y)
+        } else if let w = button?.window {
+            let f = w.convertToScreen(button!.bounds)
+            origin = NSPoint(x: f.maxX - panel.frame.width, y: f.minY - panel.frame.height - 6)
+        }
+        guard var o = origin else { return }
+        // Keep it on a screen even if displays changed since the position was saved.
+        let visible = (NSScreen.screens.first { $0.frame.contains(o) } ?? NSScreen.main)?.visibleFrame
+        if let v = visible {
+            o.x = min(max(o.x, v.minX), v.maxX - panel.frame.width)
+            o.y = min(max(o.y, v.minY), v.maxY - panel.frame.height)
+        }
+        panel.setFrameOrigin(o)
+    }
+
+    func show(below button: NSStatusBarButton?) {
+        placeIfNeeded(below: button)
+        panel.orderFrontRegardless()
+        panel.makeKey()
+        // Borderless panels get no dismissal for free.
+        outsideMonitor = NSEvent.addGlobalMonitorForEvents(matching: [.leftMouseDown, .rightMouseDown]) { [weak self] _ in
+            self?.hide()
+        }
+        keyMonitor = NSEvent.addLocalMonitorForEvents(matching: .keyDown) { [weak self] e in
+            if e.keyCode == 53 { self?.hide(); return nil }    // Escape
+            return e
+        }
+    }
+
+    func hide() {
+        [outsideMonitor, keyMonitor].forEach { if let m = $0 { NSEvent.removeMonitor(m) } }
+        outsideMonitor = nil; keyMonitor = nil
+        panel.orderOut(nil)
+    }
+}
+
 // MARK: - App
 
 class AppDelegate: NSObject, NSApplicationDelegate {
@@ -1900,29 +1987,24 @@ class AppDelegate: NSObject, NSApplicationDelegate {
     let model = PowerModel()
     let engine = BatteryEngine()
     let topApps = TopApps()
-    let popover = NSPopover()
+    var panel: Panel!
 
     func applicationDidFinishLaunching(_ note: Notification) {
         engine.refresh()
         topApps.start()
-        popover.behavior = .transient
-        popover.appearance = NSAppearance(named: .aqua)   // light regardless of the system setting
-        // NSPopover adopts the hosting controller's own size once the view lays out,
-        // so a hand-declared contentSize that disagrees makes the popover resize after
-        // it is already on screen. The content is 58pt shorter than the 380 that used
-        // to be declared here, and the popover swallowed that difference off the top —
-        // exactly where the tab bar sits. Take the size from the view instead of
-        // guessing it, so it stays correct if the layout changes.
-        let host = NSHostingController(rootView: PowerFlowView(model: model, engine: engine, topApps: topApps))
-        host.view.layoutSubtreeIfNeeded()
-        let fitting = host.view.fittingSize
-        popover.contentSize = fitting.height > 0 ? fitting : NSSize(width: 380, height: 322)
-        popover.contentViewController = host
+        // Size comes from the view, not a hand-written constant, so the two cannot
+        // disagree and clip the tab bar off the top.
+        let host = NSHostingView(rootView: PowerFlowView(model: model, engine: engine, topApps: topApps))
+        host.layoutSubtreeIfNeeded()
+        let fitting = host.fittingSize
+        let size = fitting.height > 0 ? fitting : NSSize(width: 380, height: 364)
+        host.setFrameSize(size)
+        panel = Panel(content: host, size: size)
 
         if let btn = statusItem.button {
             btn.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
             btn.title = "…W"
-            btn.action = #selector(togglePopover)
+            btn.action = #selector(togglePanel)
             btn.target = self
         }
         model.onTick = { [weak self] in
@@ -1940,13 +2022,8 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         ])
     }
 
-    @objc func togglePopover() {
-        guard let btn = statusItem.button else { return }
-        if popover.isShown { popover.performClose(nil) }
-        else {
-            popover.show(relativeTo: btn.bounds, of: btn, preferredEdge: .minY)
-            popover.contentViewController?.view.window?.makeKey()
-        }
+    @objc func togglePanel() {
+        if panel.isVisible { panel.hide() } else { panel.show(below: statusItem.button) }
     }
 }
 
