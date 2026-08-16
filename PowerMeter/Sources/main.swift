@@ -45,6 +45,21 @@ struct PowerSnapshot {
     // Per-cell readings
     var cellVoltages: [Double] = []  // V
     var cellRa: [Int] = []           // internal resistance, unitless SMC scale
+    // Today's charge window — shows whether a charge limit is actually holding
+    var dailyMaxSoc: Int = -1
+    var dailyMinSoc: Int = -1
+    // LifetimeData: extremes the pack has seen since it was built
+    var lifeHours: Int = 0
+    var lifeMaxTempC: Double = 0
+    var lifeMinTempC: Double = 0
+    var lifeAvgTempC: Double = 0
+    var lifeMaxChargeA: Double = 0
+    var lifeMaxDischargeA: Double = 0
+    var lifeMaxPackV: Double = 0
+    var lifeMinPackV: Double = 0
+    // Fault flags
+    var permanentFailure: Int = 0
+    var cellDisconnects: Int = 0
 
     var healthPct: Int { designCap > 0 ? Int((Double(rawMaxCap) / Double(designCap) * 100).rounded()) : 0 }
     var condition: String { healthPct >= 80 ? "정상" : (healthPct >= 60 ? "양호" : "서비스 권장") }
@@ -79,6 +94,16 @@ struct PowerSnapshot {
     }
 }
 
+/// One SMC temperature sensor. Apple documents none of these key names, so the key
+/// is shown as-is rather than given an invented label; only TB* is identified, and
+/// only because its readings track the battery temperature IOKit reports.
+struct TempReading: Identifiable {
+    let key: String
+    let c: Double
+    var id: String { key }
+    var isBattery: Bool { key.hasPrefix("TB") }
+}
+
 struct PDProfile: Identifiable {
     let index: Int
     let volts: Double
@@ -107,12 +132,18 @@ final class SMCReader {
         static let total = 80
     }
     private static let cmdReadBytes: UInt8 = 5
+    private static let cmdReadIndex: UInt8 = 8
     private static let cmdReadKeyInfo: UInt8 = 9
     private static let kernelIndex: UInt32 = 2
     private static let floatType = fourCC("flt ")
 
     private var conn: io_connect_t = 0
     private(set) var available = false
+    // A key's size and type never change, but re-asking for them doubles the cost of
+    // every read (0.40ms against 0.21ms measured). Enumeration runs off the main
+    // thread, so the connection and the cache are both behind this lock.
+    private let lock = NSLock()
+    private var infoCache: [String: (size: UInt32, type: UInt32)] = [:]
 
     init() {
         let svc = IOServiceGetMatchingService(kIOMainPortDefault, IOServiceMatching("AppleSMC"))
@@ -135,6 +166,7 @@ final class SMCReader {
     }
 
     private func call(_ input: inout [UInt8]) -> [UInt8]? {
+        lock.lock(); defer { lock.unlock() }
         var output = [UInt8](repeating: 0, count: Off.total)
         var outSize = Off.total
         let kr = input.withUnsafeMutableBytes { ip in
@@ -148,22 +180,70 @@ final class SMCReader {
         return output
     }
 
-    /// Reads a 4-byte `flt ` key. Returns nil if the key is absent or another type.
-    func readFloat(_ key: String) -> Double? {
-        guard available else { return nil }
-        var info = [UInt8](repeating: 0, count: Off.total)
-        put32(&info, Off.key, Self.fourCC(key))
-        info[Off.data8] = Self.cmdReadKeyInfo
-        guard let meta = call(&info) else { return nil }
-        let size = get32(meta, Off.dataSize)
-        guard get32(meta, Off.dataType) == Self.floatType, size >= 4 else { return nil }
+    private func info(_ key: String) -> (size: UInt32, type: UInt32)? {
+        lock.lock()
+        if let hit = infoCache[key] { lock.unlock(); return hit }
+        lock.unlock()
+        var req = [UInt8](repeating: 0, count: Off.total)
+        put32(&req, Off.key, Self.fourCC(key))
+        req[Off.data8] = Self.cmdReadKeyInfo
+        guard let meta = call(&req) else { return nil }
+        let entry = (size: get32(meta, Off.dataSize), type: get32(meta, Off.dataType))
+        lock.lock(); infoCache[key] = entry; lock.unlock()
+        return entry
+    }
 
+    private func rawBytes(_ key: String, _ size: UInt32) -> [UInt8]? {
         var req = [UInt8](repeating: 0, count: Off.total)
         put32(&req, Off.key, Self.fourCC(key))
         put32(&req, Off.dataSize, size)
         req[Off.data8] = Self.cmdReadBytes
         guard let out = call(&req) else { return nil }
-        return Double(out[Off.bytes..<Off.bytes+4].withUnsafeBytes { $0.loadUnaligned(as: Float32.self) })
+        return Array(out[Off.bytes..<Off.bytes + Int(min(size, 32))])
+    }
+
+    /// Reads a 4-byte `flt ` key. Returns nil if the key is absent or another type.
+    func readFloat(_ key: String) -> Double? {
+        guard available, let meta = info(key), meta.type == Self.floatType, meta.size >= 4,
+              let b = rawBytes(key, meta.size), b.count >= 4 else { return nil }
+        return Double(b[0..<4].withUnsafeBytes { $0.loadUnaligned(as: Float32.self) })
+    }
+
+    /// Reads a single-byte key such as the fan count.
+    func readUInt8(_ key: String) -> Int? {
+        guard available, let meta = info(key), meta.size >= 1,
+              let b = rawBytes(key, meta.size), let first = b.first else { return nil }
+        return Int(first)
+    }
+
+    /// Every key the SMC publishes. ~1500 entries and ~300ms, so callers run it once
+    /// off the main thread and keep the result.
+    func allKeys() -> [String] {
+        guard available, let countMeta = info("#KEY"), let cb = rawBytes("#KEY", countMeta.size), cb.count >= 4
+        else { return [] }
+        let total = Int(UInt32(cb[0]) << 24 | UInt32(cb[1]) << 16 | UInt32(cb[2]) << 8 | UInt32(cb[3]))
+        guard total > 0, total < 10_000 else { return [] }
+        var keys: [String] = []
+        keys.reserveCapacity(total)
+        for i in 0..<total {
+            var req = [UInt8](repeating: 0, count: Off.total)
+            req[Off.data8] = Self.cmdReadIndex
+            put32(&req, 44, UInt32(i))               // data32 sits at offset 44
+            guard let out = call(&req) else { continue }
+            let code = get32(out, Off.key)
+            guard code != 0,
+                  let name = String(bytes: [UInt8((code >> 24) & 0xff), UInt8((code >> 16) & 0xff),
+                                            UInt8((code >> 8) & 0xff), UInt8(code & 0xff)],
+                                    encoding: .ascii) else { continue }
+            keys.append(name)
+        }
+        return keys
+    }
+
+    /// Fan speeds in RPM. Empty on fanless Macs, where the keys are absent entirely.
+    func fanRPMs() -> [Double] {
+        guard let n = readUInt8("FNum"), n > 0, n < 10 else { return [] }
+        return (0..<n).compactMap { readFloat(String(format: "F%dAc", $0)) }
     }
 
     /// System draw and adapter supply, in watts. Nil unless *both* keys read, so a
@@ -244,9 +324,23 @@ enum PowerReader {
             s.chargerInhibit    = UInt64(bitPattern: Int64((cd["ChargerInhibitReason"] as? Int) ?? 0))
             s.thermalLimitedSec = (cd["TimeChargingThermallyLimited"] as? Int) ?? 0
         }
+        s.permanentFailure = (p["PermanentFailureStatus"] as? Int) ?? 0
+        s.cellDisconnects  = (p["BatteryCellDisconnectCount"] as? Int) ?? 0
         if let bd = p["BatteryData"] as? [String: Any] {
             if let cv = bd["CellVoltage"] as? [Int] { s.cellVoltages = cv.map { Double($0) / 1000.0 } }
             if let ra = bd["WeightedRa"] as? [Int] { s.cellRa = ra }
+            s.dailyMaxSoc = (bd["DailyMaxSoc"] as? Int) ?? -1
+            s.dailyMinSoc = (bd["DailyMinSoc"] as? Int) ?? -1
+            if let lt = bd["LifetimeData"] as? [String: Any] {
+                s.lifeHours          = (lt["TotalOperatingTime"] as? Int) ?? 0
+                s.lifeMaxTempC       = Double((lt["MaximumTemperature"] as? Int) ?? 0) / 10.0
+                s.lifeMinTempC       = Double((lt["MinimumTemperature"] as? Int) ?? 0) / 10.0
+                s.lifeAvgTempC       = Double((lt["AverageTemperature"] as? Int) ?? 0) / 10.0
+                s.lifeMaxChargeA     = Double((lt["MaximumChargeCurrent"] as? Int) ?? 0) / 1000.0
+                s.lifeMaxDischargeA  = Double(abs((lt["MaximumDischargeCurrent"] as? Int) ?? 0)) / 1000.0
+                s.lifeMaxPackV       = Double((lt["MaximumPackVoltage"] as? Int) ?? 0) / 1000.0
+                s.lifeMinPackV       = Double((lt["MinimumPackVoltage"] as? Int) ?? 0) / 1000.0
+            }
         }
         s.valid = true
         return s
@@ -277,6 +371,26 @@ final class PowerModel: ObservableObject {
     private var healthTimer: Timer?
     private var psSource: CFRunLoopSource?
     var onTick: (() -> Void)?
+
+    // Live sensors. Reading all ~146 temperature keys costs 28ms, so the full sweep
+    // runs on the slow cycle off the main thread and only the hottest few are polled
+    // per tick (1.65ms). The hot set is re-picked each sweep so it follows the load.
+    @Published var temps: [TempReading] = []
+    @Published var batteryTempC: Double = 0
+    @Published var fanRPMs: [Double] = []
+    @Published var history: [Double] = []      // system watts, oldest first
+
+    private var tempKeys: [String] = []
+    private var watchKeys: [String] = []
+    private let watchCount = 6
+    private let historyCap = 300
+
+    var maxTemp: TempReading? { temps.max { $0.c < $1.c } }
+    /// How far back `history` reaches at the current tick rate.
+    var historySpan: String {
+        let sec = Int(Double(max(history.count - 1, 0)) * interval)
+        return sec >= 60 ? "최근 \(sec / 60)분" : "최근 \(sec)초"
+    }
 
     private let smc = SMCReader()
     // AppleSmartBattery republishes on a 60s cycle, so re-reading it every tick just
@@ -329,6 +443,37 @@ final class PowerModel: ObservableObject {
         }
     }
 
+    // Sweeps every temperature sensor to re-pick the hot set, reads the battery
+    // sensors and the fans. ~28ms plus a one-time ~280ms key enumeration, so it all
+    // happens off the main thread.
+    private var sweeping = false
+    private func sweepSensors() {
+        guard smc.available, !sweeping else { return }
+        sweeping = true
+        DispatchQueue.global(qos: .utility).async { [weak self] in
+            guard let self else { return }
+            if self.tempKeys.isEmpty {
+                self.tempKeys = self.smc.allKeys().filter { $0.hasPrefix("T") }
+            }
+            var readings: [TempReading] = []
+            for k in self.tempKeys {
+                if let v = self.smc.readFloat(k), v > 15, v < 110 { readings.append(TempReading(key: k, c: v)) }
+            }
+            let hottest = readings.sorted { $0.c > $1.c }.prefix(self.watchCount).map(\.key)
+            // TB* tracks what IOKit reports for the battery; average them so one warm
+            // cell does not stand in for the pack.
+            let batt = readings.filter(\.isBattery)
+            let battAvg = batt.isEmpty ? 0 : batt.map(\.c).reduce(0, +) / Double(batt.count)
+            let fans = self.smc.fanRPMs()
+            DispatchQueue.main.async {
+                self.watchKeys = hottest
+                if battAvg > 0 { self.batteryTempC = battAvg }
+                self.fanRPMs = fans
+                self.sweeping = false
+            }
+        }
+    }
+
     // Read macOS's official "Maximum Capacity %" + Condition (smoothed Apple metric).
     private func sampleMacHealth() {
         DispatchQueue.global().async {
@@ -362,6 +507,7 @@ final class PowerModel: ObservableObject {
         if forceSlowRead || Date().timeIntervalSince(lastSlowRead) >= slowInterval {
             let fresh = PowerReader.read()
             if fresh.valid { slowSnap = fresh; lastSlowRead = Date(); forceSlowRead = false }
+            sweepSensors()
         }
         var s = slowSnap
         guard s.valid else { return }
@@ -374,6 +520,14 @@ final class PowerModel: ObservableObject {
             s.batteryW = s.adapterW - live.system
             s.live = true
         }
+
+        // Poll only the hot set; the sweep that chooses it runs on the slow cycle.
+        if !watchKeys.isEmpty {
+            let readings = watchKeys.compactMap { k in smc.readFloat(k).map { TempReading(key: k, c: $0) } }
+            if !readings.isEmpty { temps = readings.sorted { $0.c > $1.c } }
+        }
+        history.append(s.systemW)
+        if history.count > historyCap { history.removeFirst(history.count - historyCap) }
 
         let adapterActive = s.external && s.adapterW > 0.5
         let dis = max(0, -s.batteryW)
@@ -689,6 +843,42 @@ struct FlowCanvas: View {
     }
 }
 
+/// Rolling system-power trace. Drawn with Canvas like FlowCanvas rather than pulled
+/// in from a charting framework — there are no axes, legend or hit-testing here, so
+/// a chart library would only cost styling control.
+struct Sparkline: View {
+    let samples: [Double]
+    var body: some View {
+        Canvas { ctx, size in
+            guard samples.count > 1 else { return }
+            let hi = max(samples.max() ?? 1, 0.1)
+            let lo = min(samples.min() ?? 0, hi)
+            let span = max(hi - lo, 0.5)          // keep a flat trace from filling the box
+            let dx = size.width / CGFloat(samples.count - 1)
+            func point(_ i: Int) -> CGPoint {
+                let y = size.height - CGFloat((samples[i] - lo) / span) * (size.height - 4) - 2
+                return CGPoint(x: CGFloat(i) * dx, y: y)
+            }
+            var line = Path()
+            line.move(to: point(0))
+            for i in 1..<samples.count { line.addLine(to: point(i)) }
+
+            var fill = line
+            fill.addLine(to: CGPoint(x: size.width, y: size.height))
+            fill.addLine(to: CGPoint(x: 0, y: size.height))
+            fill.closeSubpath()
+            ctx.fill(fill, with: .linearGradient(
+                Gradient(colors: [Color.green.opacity(0.28), Color.green.opacity(0.02)]),
+                startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height)))
+            ctx.stroke(line, with: .color(.green.opacity(0.9)), lineWidth: 1.5)
+
+            let last = point(samples.count - 1)
+            ctx.fill(Path(ellipseIn: CGRect(x: last.x - 2.5, y: last.y - 2.5, width: 5, height: 5)),
+                     with: .color(.green))
+        }
+    }
+}
+
 // Selectable chip. The stock segmented picker renders unselected segments nearly
 // invisible against this dark background, so choices use this instead.
 struct ChoiceChip: View {
@@ -816,23 +1006,26 @@ struct PowerFlowView: View {
         VStack(spacing: 0) {
             HStack(spacing: 3) {
                 TabButton(title: "흐름", active: tab == 0) { tab = 0 }
-                TabButton(title: "건강", active: tab == 1) { tab = 1 }
-                TabButton(title: "충전", active: tab == 2) { tab = 2 }
-                TabButton(title: "설정", active: tab == 3) { tab = 3 }
+                TabButton(title: "온도", active: tab == 1) { tab = 1 }
+                TabButton(title: "건강", active: tab == 2) { tab = 2 }
+                TabButton(title: "충전", active: tab == 3) { tab = 3 }
+                TabButton(title: "설정", active: tab == 4) { tab = 4 }
             }
             .padding(.horizontal, 10).padding(.top, 8).padding(.bottom, 4)
 
             Group {
                 switch tab {
                 case 0: flowTab
-                case 1: healthTab
-                case 2: chargeTab
+                case 1: tempTab
+                case 2: healthTab
+                case 3: chargeTab
                 default: settingsTab
                 }
             }
-            // Tallest tab is 설정 at 263pt; a shorter frame pushed its version line
-            // past the boundary and onto the divider below.
-            .frame(height: 268)
+            // Sized to the tallest non-scrolling tab — 흐름 at 284pt once the sparkline
+            // is in. 건강 scrolls, so it is exempt. A frame shorter than the content
+            // pushes the bottom row onto the divider below instead of clipping.
+            .frame(height: 292)
 
             Divider().background(Color(white: 0.3)).padding(.horizontal, 16)
 
@@ -872,6 +1065,18 @@ struct PowerFlowView: View {
                     .position(battC)
             }
             .frame(width: 360, height: 198)
+            if model.history.count > 1 {
+                VStack(alignment: .leading, spacing: 2) {
+                    HStack {
+                        Text(model.historySpan).font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
+                        Spacer()
+                        Text(String(format: "최대 %.1fW", model.history.max() ?? 0))
+                            .font(.system(size: 9)).foregroundColor(.white.opacity(0.35)).monospacedDigit()
+                    }
+                    Sparkline(samples: model.history).frame(height: 34)
+                }
+                .padding(.horizontal, 16)
+            }
             Spacer(minLength: 0)
         }
     }
@@ -958,6 +1163,28 @@ struct PowerFlowView: View {
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.top, 2)
                 }
+                if s.dailyMinSoc >= 0 && s.dailyMaxSoc >= 0 {
+                    Divider().background(Color(white: 0.25)).padding(.vertical, 4)
+                    StatRow(label: "오늘 사용 구간",
+                            value: "\(s.dailyMinSoc)% – \(s.dailyMaxSoc)%  (\(s.dailyMaxSoc - s.dailyMinSoc)%p)")
+                }
+                if s.lifeHours > 0 {
+                    Divider().background(Color(white: 0.25)).padding(.vertical, 4)
+                    StatRow(label: "평생 기록", value: "")
+                    StatRow(label: "  └ 총 가동 시간", value: "\(s.lifeHours) 시간")
+                    StatRow(label: "  └ 온도 범위",
+                            value: String(format: "%.1f ~ %.1f °C  (평균 %.1f)", s.lifeMinTempC, s.lifeMaxTempC, s.lifeAvgTempC),
+                            accent: s.lifeMaxTempC >= 45 ? .orange : .white)
+                    StatRow(label: "  └ 최대 충전 / 방전",
+                            value: String(format: "%.2f A / %.2f A", s.lifeMaxChargeA, s.lifeMaxDischargeA))
+                    StatRow(label: "  └ 팩 전압 범위",
+                            value: String(format: "%.2f ~ %.2f V", s.lifeMinPackV, s.lifeMaxPackV))
+                }
+                if s.permanentFailure != 0 || s.cellDisconnects != 0 {
+                    StatRow(label: "  └ 고장 지표",
+                            value: "영구고장 \(s.permanentFailure) · 셀단선 \(s.cellDisconnects)",
+                            accent: .orange)
+                }
                 Divider().background(Color(white: 0.25)).padding(.vertical, 4)
                 HStack {
                     Text("에너지 사용 상위 앱").font(.system(size: 12, weight: .medium))
@@ -995,6 +1222,57 @@ struct PowerFlowView: View {
         }
         if s.soc >= 100 { return "완충 상태입니다." }
         return s.notChargingText
+    }
+
+    // MARK: Tab — temperature
+    var tempTab: some View {
+        VStack(alignment: .leading, spacing: 0) {
+            if model.temps.isEmpty {
+                Text("센서를 읽는 중…").font(.system(size: 11)).foregroundColor(.white.opacity(0.4))
+                    .frame(maxWidth: .infinity, alignment: .center).padding(.top, 40)
+            } else {
+                HStack(alignment: .firstTextBaseline) {
+                    Text("최고 온도").font(.system(size: 12)).foregroundColor(.white.opacity(0.55))
+                    Spacer()
+                    if let m = model.maxTemp {
+                        Text(String(format: "%.1f °C", m.c))
+                            .font(.system(size: 22, weight: .bold)).monospacedDigit()
+                            .foregroundColor(m.c >= 80 ? .orange : (m.c >= 95 ? .red : .white))
+                        Text(m.key).font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
+                    }
+                }
+                .padding(.bottom, 2)
+                if model.batteryTempC > 0 {
+                    StatRow(label: "배터리 (TB 센서 평균)",
+                            value: String(format: "%.1f °C", model.batteryTempC),
+                            accent: model.batteryTempC >= 35 ? .orange : .white)
+                }
+                if model.fanRPMs.isEmpty {
+                    StatRow(label: "팬", value: "없음 (팬리스 모델)", accent: .white.opacity(0.5))
+                } else {
+                    ForEach(Array(model.fanRPMs.enumerated()), id: \.offset) { i, rpm in
+                        StatRow(label: "팬 \(i + 1)", value: String(format: "%.0f RPM", rpm),
+                                accent: rpm > 0 ? .white : .white.opacity(0.5))
+                    }
+                }
+                Divider().background(Color(white: 0.25)).padding(.vertical, 5)
+                HStack {
+                    Text("가장 뜨거운 센서").font(.system(size: 11, weight: .medium))
+                        .foregroundColor(.white.opacity(0.7))
+                    Spacer()
+                    Text("SMC 키 원문").font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
+                }
+                ForEach(model.temps) { t in
+                    StatRow(label: "  \(t.key)", value: String(format: "%.1f °C", t.c),
+                            accent: t.c >= 80 ? .orange : .white)
+                }
+                Text("센서 키 이름은 Apple이 공개하지 않아 원문 그대로 표시합니다. 전체 센서를 훑어 가장 뜨거운 것들만 추적합니다.")
+                    .font(.system(size: 9)).foregroundColor(.white.opacity(0.32))
+                    .fixedSize(horizontal: false, vertical: true).padding(.top, 4)
+            }
+            Spacer(minLength: 0)
+        }
+        .padding(.horizontal, 16).padding(.top, 10)
     }
 
     var calibrationText: String {
@@ -1070,7 +1348,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.5.3  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.6  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
