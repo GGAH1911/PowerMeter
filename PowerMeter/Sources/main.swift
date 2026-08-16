@@ -102,6 +102,27 @@ struct TempReading: Identifiable {
     let c: Double
     var id: String { key }
     var isBattery: Bool { key.hasPrefix("TB") }
+
+    /// Which part of the machine the key's prefix denotes. Only the family is claimed,
+    /// never the individual sensor — the same key names a performance core on one chip
+    /// and an efficiency core on the next, so "Tp4z is core 4" would be invention.
+    /// The families themselves hold up: on this Mac the CPU ones run hottest, SSD sits
+    /// in the middle and TB* lands where IOKit puts the battery.
+    var family: String? {
+        switch key.prefix(2) {
+        case "TB": return "배터리"
+        case "Tp": return "CPU 코어"
+        case "Te": return "CPU 다이"
+        case "Th": return "SoC 히트싱크"
+        case "Ts": return "SSD"
+        case "Tg": return "GPU"
+        default:   return nil
+        }
+    }
+
+    /// Tp/Te only. TC* mixes hot and cool sensors so its meaning is unclear, and
+    /// excluding it costs nothing — TCMz reads identical to the hottest Tp sensor.
+    var isCPU: Bool { key.hasPrefix("Tp") || key.hasPrefix("Te") }
 }
 
 struct PDProfile: Identifiable {
@@ -384,6 +405,10 @@ final class PowerModel: ObservableObject {
     // sooner; IOKit's own Temperature is a different point on the pack and sits ~4°C
     // lower. Reading one identified key keeps every tab on one number.
     @Published private(set) var batteryTempKey: String?
+    /// Hottest CPU-family sensor, tracked per tick so the flow diagram can label the
+    /// Mac node with the Mac's own temperature instead of the battery's.
+    @Published private(set) var cpuTempC: Double = 0
+    @Published private(set) var cpuTempKey: String?
 
     private var tempKeys: [String] = []
     private var watchKeys: [String] = []
@@ -464,7 +489,13 @@ final class PowerModel: ObservableObject {
             for k in self.tempKeys {
                 if let v = self.smc.readFloat(k), v > 15, v < 110 { readings.append(TempReading(key: k, c: v)) }
             }
-            let hottest = readings.sorted { $0.c > $1.c }.prefix(self.watchCount).map(\.key)
+            var hottest = readings.sorted { $0.c > $1.c }.prefix(self.watchCount).map(\.key)
+            // Guarantee at least one CPU sensor is watched even if other parts run hotter,
+            // so the CPU reading never goes blank.
+            if !hottest.contains(where: { $0.hasPrefix("Tp") || $0.hasPrefix("Te") }),
+               let cpu = readings.filter(\.isCPU).max(by: { $0.c < $1.c })?.key {
+                hottest.append(cpu)
+            }
             // Lowest-numbered TB sensor, not an average across them: TB0T is the one
             // that matches IOKit's VirtualTemperature, and averaging in the cooler
             // TB2T would produce a number no other source reports.
@@ -529,7 +560,16 @@ final class PowerModel: ObservableObject {
         // Poll only the hot set; the sweep that chooses it runs on the slow cycle.
         if !watchKeys.isEmpty {
             let readings = watchKeys.compactMap { k in smc.readFloat(k).map { TempReading(key: k, c: $0) } }
-            if !readings.isEmpty { temps = readings.sorted { $0.c > $1.c } }
+            if !readings.isEmpty {
+                temps = readings.sorted { $0.c > $1.c }
+                // Take the CPU peak from this tick's readings rather than pinning the
+                // key the sweep picked: cores trade places between sweeps, and a pinned
+                // key reports a cooler core while a hotter one sits in the same list.
+                if let hottestCPU = temps.first(where: \.isCPU) {
+                    cpuTempC = hottestCPU.c
+                    cpuTempKey = hottestCPU.key
+                }
+            }
         }
         // Battery temperature comes from SMC when it can, so the flow, health and
         // temperature tabs cannot disagree about it. IOKit's value stays as fallback.
@@ -1065,11 +1105,15 @@ struct PowerFlowView: View {
                         value: s.external ? fmtW(s.adapterW) : "—",
                         dim: (model.state == .battery))   // dim only when truly unplugged
                     .position(adapterC)
+                // The Mac node carries the Mac's temperature and the battery node the
+                // battery's. It used to show the battery reading on both.
                 NodeBox(emoji: "💻", label: "맥 사용", value: fmtW(s.systemW), dim: false,
-                        sub: s.tempC > 0 ? String(format: "🌡 %.1f°C", s.tempC) : nil,
-                        subColor: s.tempC >= 35 ? .orange : .white.opacity(0.5))
+                        sub: model.cpuTempC > 0 ? String(format: "🌡 %.0f°C", model.cpuTempC) : nil,
+                        subColor: model.cpuTempC >= 90 ? .orange : .white.opacity(0.5))
                     .position(macC)
-                NodeBox(emoji: "🔋", label: "배터리", value: "\(s.soc)%\(battArrow)", dim: false)
+                NodeBox(emoji: "🔋", label: "배터리", value: "\(s.soc)%\(battArrow)", dim: false,
+                        sub: s.tempC > 0 ? String(format: "🌡 %.1f°C", s.tempC) : nil,
+                        subColor: s.tempC >= 40 ? .orange : .white.opacity(0.5))
                     .position(battC)
             }
             .frame(width: 360, height: 198)
@@ -1249,16 +1293,18 @@ struct PowerFlowView: View {
                     .frame(maxWidth: .infinity, alignment: .center).padding(.top, 40)
             } else {
                 HStack(alignment: .firstTextBaseline) {
-                    Text("최고 온도").font(.system(size: 12)).foregroundColor(.white.opacity(0.55))
+                    Text("CPU 온도").font(.system(size: 12)).foregroundColor(.white.opacity(0.55))
                     Spacer()
-                    if let m = model.maxTemp {
-                        Text(String(format: "%.1f °C", m.c))
-                            .font(.system(size: 22, weight: .bold)).monospacedDigit()
-                            .foregroundColor(tempColor(m.c))
-                        Text(m.key).font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
-                    }
+                    Text(model.cpuTempC > 0 ? String(format: "%.1f °C", model.cpuTempC) : "—")
+                        .font(.system(size: 22, weight: .bold)).monospacedDigit()
+                        .foregroundColor(tempColor(model.cpuTempC))
+                    Text(model.cpuTempKey ?? "").font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 }
                 .padding(.bottom, 2)
+                if let m = model.maxTemp, !m.isCPU {
+                    StatRow(label: "최고 온도  (\(m.key))", value: String(format: "%.1f °C", m.c),
+                            accent: tempColor(m.c))
+                }
                 if model.snap.tempC > 0 {
                     StatRow(label: "배터리" + (model.batteryTempKey.map { "  (\($0))" } ?? "  (IOKit)"),
                             value: String(format: "%.1f °C", model.snap.tempC),
@@ -1280,8 +1326,8 @@ struct PowerFlowView: View {
                     Text("SMC 키 원문").font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 }
                 ForEach(model.temps) { t in
-                    StatRow(label: "  \(t.key)", value: String(format: "%.1f °C", t.c),
-                            accent: tempColor(t.c))
+                    StatRow(label: "  \(t.key)" + (t.family.map { "  \($0)" } ?? ""),
+                            value: String(format: "%.1f °C", t.c), accent: tempColor(t.c))
                 }
                 Text("센서 키 이름은 Apple이 공개하지 않고 같은 키가 칩 세대마다 다른 것을 가리키기도 해서, 이름을 붙이지 않고 원문 그대로 표시합니다. 가장 뜨거운 센서는 보통 다이 온도라 부하 중 80~100°C는 정상이며 그 위에서 스로틀링이 걸립니다.")
                     .font(.system(size: 9)).foregroundColor(.white.opacity(0.32))
@@ -1365,7 +1411,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.6.2  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.7  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
