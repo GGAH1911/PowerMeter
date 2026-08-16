@@ -1001,46 +1001,69 @@ struct Sparkline: View {
     }
 }
 
-/// CPU and battery temperature on one shared scale. Sharing it means the battery
-/// line sits low and flat, which is what the battery actually does — a second axis
-/// would stretch a 2°C drift into something that looks like a trend.
-struct TempChart: View {
-    let samples: [TempSample]
-    static let cpuColor = Color.orange
-    static let battColor = Color.teal
+/// One temperature series on its own scale. CPU and battery get separate charts:
+/// sharing an axis pinned the battery to a flat line at the bottom, which said
+/// nothing about the two degrees it does move.
+///
+/// An hour of ticks is more samples than the view has pixels, so each column is
+/// averaged rather than overplotted — raw, every column drew its full spread and the
+/// trace read as a picket fence. The label still quotes the true min and max, so
+/// smoothing the line never hides the range.
+struct TempSeriesChart: View {
+    let values: [Double]
+    let color: Color
 
-    var body: some View {
-        let cpu = samples.map(\.cpu).filter { $0 > 0 }
-        let batt = samples.map(\.batt).filter { $0 > 0 }
-        let hi = max(cpu.max() ?? 0, batt.max() ?? 0, 1)
-        let lo = min(cpu.min() ?? hi, batt.min() ?? hi)
-        let span = max(hi - lo, 5)              // never zoom into sensor noise
-        return Canvas { ctx, size in
-            guard samples.count > 1 else { return }
-            let dx = size.width / CGFloat(samples.count - 1)
-            func draw(_ values: [Double], _ color: Color) {
-                var path = Path()
-                var started = false
-                for (i, v) in values.enumerated() where v > 0 {
-                    let y = size.height - CGFloat((v - lo) / span) * (size.height - 4) - 2
-                    let p = CGPoint(x: CGFloat(i) * dx, y: y)
-                    if started { path.addLine(to: p) } else { path.move(to: p); started = true }
-                }
-                guard started else { return }
-                ctx.stroke(path, with: .color(color), lineWidth: 1.5)
-            }
-            draw(samples.map(\.batt), Self.battColor)
-            draw(samples.map(\.cpu), Self.cpuColor)
+    private var clean: [Double] { values.filter { $0 > 0 } }
+
+    var range: (lo: Double, hi: Double)? {
+        guard let lo = clean.min(), let hi = clean.max() else { return nil }
+        return (lo, hi)
+    }
+
+    var label: String {
+        guard let r = range else { return "" }
+        return String(format: "%.0f–%.0f°C", r.lo, r.hi)
+    }
+
+    /// Mean per pixel column, so the line reads as a trend at any window length.
+    private func downsample(_ v: [Double], to width: Int) -> [Double] {
+        guard width > 0, v.count > width else { return v }
+        let bucket = Double(v.count) / Double(width)
+        return (0..<width).map { i in
+            let from = Int(Double(i) * bucket)
+            let to = min(v.count, max(from + 1, Int(Double(i + 1) * bucket)))
+            let slice = v[from..<to]
+            return slice.reduce(0, +) / Double(slice.count)
         }
     }
 
-    var scaleLabel: String {
-        let cpu = samples.map(\.cpu).filter { $0 > 0 }
-        let batt = samples.map(\.batt).filter { $0 > 0 }
-        let hi = max(cpu.max() ?? 0, batt.max() ?? 0)
-        let lo = min(cpu.min() ?? hi, batt.min() ?? hi)
-        return String(format: "%.0f–%.0f°C", lo, hi)
+    var body: some View {
+        Canvas { ctx, size in
+            let pts = downsample(clean, to: Int(size.width))
+            guard pts.count > 1, let r = range else { return }
+            let span = max(r.hi - r.lo, 3)      // never zoom into sensor noise
+            let dx = size.width / CGFloat(pts.count - 1)
+            var line = Path()
+            for (i, v) in pts.enumerated() {
+                let y = size.height - CGFloat((v - r.lo) / span) * (size.height - 4) - 2
+                let p = CGPoint(x: CGFloat(i) * dx, y: y)
+                if i == 0 { line.move(to: p) } else { line.addLine(to: p) }
+            }
+            var fill = line
+            fill.addLine(to: CGPoint(x: size.width, y: size.height))
+            fill.addLine(to: CGPoint(x: 0, y: size.height))
+            fill.closeSubpath()
+            ctx.fill(fill, with: .linearGradient(
+                Gradient(colors: [color.opacity(0.22), color.opacity(0.02)]),
+                startPoint: .zero, endPoint: CGPoint(x: 0, y: size.height)))
+            ctx.stroke(line, with: .color(color), lineWidth: 1.5)
+        }
     }
+}
+
+enum TempPalette {
+    static let cpu = Color.orange
+    static let batt = Color.teal
 }
 
 // Selectable chip. The stock segmented picker renders unselected segments nearly
@@ -1414,7 +1437,7 @@ struct PowerFlowView: View {
                     .frame(maxWidth: .infinity, alignment: .center).padding(.top, 40)
             } else {
                 HStack(alignment: .firstTextBaseline) {
-                    Circle().fill(TempChart.cpuColor).frame(width: 7, height: 7)
+                    Circle().fill(TempPalette.cpu).frame(width: 7, height: 7)
                     Text("CPU").font(.system(size: 12)).foregroundColor(.white.opacity(0.6))
                     Spacer()
                     Text(model.cpuTempC > 0 ? String(format: "%.1f °C", model.cpuTempC) : "—")
@@ -1424,7 +1447,7 @@ struct PowerFlowView: View {
                         .foregroundColor(.white.opacity(0.25)).frame(width: 30, alignment: .leading)
                 }
                 HStack(alignment: .firstTextBaseline) {
-                    Circle().fill(TempChart.battColor).frame(width: 7, height: 7)
+                    Circle().fill(TempPalette.batt).frame(width: 7, height: 7)
                     Text("배터리").font(.system(size: 12)).foregroundColor(.white.opacity(0.6))
                     Spacer()
                     Text(model.snap.tempC > 0 ? String(format: "%.1f °C", model.snap.tempC) : "—")
@@ -1445,20 +1468,33 @@ struct PowerFlowView: View {
                 }
 
                 Divider().background(Color(white: 0.25)).padding(.top, 3)
-                let chart = TempChart(samples: model.tempHistory)
-                HStack {
-                    Text(model.tempHistorySpan).font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
-                    Spacer()
-                    if model.tempHistory.count > 1 {
-                        Text(chart.scaleLabel).font(.system(size: 9))
-                            .foregroundColor(.white.opacity(0.35)).monospacedDigit()
-                    }
-                }
+                let cpuChart = TempSeriesChart(values: model.tempHistory.map(\.cpu), color: TempPalette.cpu)
+                let battChart = TempSeriesChart(values: model.tempHistory.map(\.batt), color: TempPalette.batt)
                 if model.tempHistory.count > 1 {
-                    chart.frame(height: 128)
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack {
+                            Text("CPU").font(.system(size: 9)).foregroundColor(TempPalette.cpu.opacity(0.8))
+                            Spacer()
+                            Text(cpuChart.label).font(.system(size: 9))
+                                .foregroundColor(.white.opacity(0.35)).monospacedDigit()
+                        }
+                        cpuChart.frame(height: 62)
+                    }
+                    VStack(alignment: .leading, spacing: 1) {
+                        HStack {
+                            Text("배터리").font(.system(size: 9)).foregroundColor(TempPalette.batt.opacity(0.8))
+                            Spacer()
+                            Text(battChart.label).font(.system(size: 9))
+                                .foregroundColor(.white.opacity(0.35)).monospacedDigit()
+                        }
+                        battChart.frame(height: 38)
+                    }
+                    Text(model.tempHistorySpan).font(.system(size: 9))
+                        .foregroundColor(.white.opacity(0.3))
+                        .frame(maxWidth: .infinity, alignment: .trailing)
                 } else {
                     Text("기록을 모으는 중…").font(.system(size: 10)).foregroundColor(.white.opacity(0.3))
-                        .frame(maxWidth: .infinity, minHeight: 128)
+                        .frame(maxWidth: .infinity, minHeight: 120)
                 }
             }
             Spacer(minLength: 0)
@@ -1539,7 +1575,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.8  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.9  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
