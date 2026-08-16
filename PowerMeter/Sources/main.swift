@@ -4,6 +4,39 @@ import IOKit
 import IOKit.ps
 import ServiceManagement
 
+// MARK: - Palette
+//
+// The popover is light regardless of the system setting, and NSPopover's own chrome
+// is pinned to .aqua alongside it so the frame cannot stay dark around a light body.
+// Colours live here rather than inline so the next change is one edit, not eighty.
+enum UI {
+    static let background   = Color(white: 0.97)
+    static let card         = Color.white
+    static let cardBorder   = Color.black.opacity(0.12)
+    static let edge         = Color.black.opacity(0.15)   // flow diagram's static lines
+    static let chipIdle     = Color(white: 0.91)
+    static let chipBorder   = Color.black.opacity(0.16)
+    static let tabActive    = Color.white
+    static let divider      = Color.black.opacity(0.10)
+    static let neutralFill  = Color(white: 0.72)          // the calibrate button
+    static let inset        = Color.black.opacity(0.06)   // preview pill behind text
+
+    // Text. Black at a given opacity reads heavier than white does on dark, so these
+    // are not a straight inversion of the values they replaced.
+    static let text         = Color.black.opacity(0.88)
+    static let textStrong   = Color.black.opacity(0.95)
+    static func text(_ o: Double) -> Color { Color.black.opacity(min(0.92, o + 0.06)) }
+
+    // Accents on a light ground: SwiftUI's stock green and orange are tuned for dark
+    // backgrounds and wash out here, so text uses darker variants. Filled chips keep
+    // the stock colours, since white on them still carries.
+    static let good         = Color(red: 0.10, green: 0.52, blue: 0.22)
+    static let warn         = Color(red: 0.78, green: 0.42, blue: 0.00)
+    static let bad          = Color(red: 0.75, green: 0.15, blue: 0.12)
+    static let cpuLine      = Color(red: 0.85, green: 0.45, blue: 0.05)
+    static let battLine     = Color(red: 0.05, green: 0.50, blue: 0.55)
+}
+
 // MARK: - Power reading
 
 struct PowerSnapshot {
@@ -919,14 +952,14 @@ final class BatteryEngine: ObservableObject {
 struct NodeBox: View {
     let emoji: String, label: String, value: String, dim: Bool
     var sub: String? = nil
-    var subColor: Color = .white.opacity(0.5)
+    var subColor: Color = UI.text(0.5)
     var body: some View {
         VStack(spacing: 1) {
             HStack(spacing: 5) {
                 Text(emoji).font(.system(size: 16))
-                Text(label).font(.system(size: 11, weight: .medium)).foregroundColor(.white.opacity(0.55))
+                Text(label).font(.system(size: 11, weight: .medium)).foregroundColor(UI.text(0.55))
             }
-            Text(value).font(.system(size: 15, weight: .bold)).foregroundColor(.white)
+            Text(value).font(.system(size: 15, weight: .bold)).foregroundColor(UI.textStrong)
                 .monospacedDigit()
             if let sub = sub {
                 Text(sub).font(.system(size: 9, weight: .medium)).foregroundColor(subColor)
@@ -934,8 +967,8 @@ struct NodeBox: View {
             }
         }
         .frame(width: 112, height: 58)
-        .background(RoundedRectangle(cornerRadius: 14).fill(Color(white: 0.18)))
-        .overlay(RoundedRectangle(cornerRadius: 14).stroke(Color(white: 0.28), lineWidth: 1))
+        .background(RoundedRectangle(cornerRadius: 14).fill(UI.card))
+        .overlay(RoundedRectangle(cornerRadius: 14).stroke(UI.cardBorder, lineWidth: 1))
         .opacity(dim ? 0.32 : 1)
     }
 }
@@ -957,7 +990,7 @@ struct FlowCanvas: View {
                 // faint static edges
                 for l in Self.lines {
                     var p = Path(); p.move(to: l.0); p.addLine(to: l.1)
-                    ctx.stroke(p, with: .color(Color(white: 0.22)), lineWidth: 2)
+                    ctx.stroke(p, with: .color(UI.inset), lineWidth: 2)
                 }
                 // animated dots
                 for e in edges {
@@ -1091,8 +1124,8 @@ struct TempSeriesChart: View {
 }
 
 enum TempPalette {
-    static let cpu = Color.orange
-    static let batt = Color.teal
+    static let cpu = UI.cpuLine
+    static let batt = UI.battLine
 }
 
 // Selectable chip. The stock segmented picker renders unselected segments nearly
@@ -1106,13 +1139,13 @@ struct ChoiceChip: View {
         Button(action: action) {
             Text(label)
                 .font(.system(size: 11, weight: active ? .semibold : .regular))
-                .foregroundColor(active ? .white : .white.opacity(0.75))
+                .foregroundColor(active ? .white : UI.text(0.75))
                 .frame(minWidth: minWidth)
                 .padding(.vertical, 5).padding(.horizontal, 9)
                 .background(RoundedRectangle(cornerRadius: 8)
-                    .fill(active ? Color.green.opacity(0.85) : Color(white: 0.26)))
+                    .fill(active ? Color.green.opacity(0.85) : UI.chipIdle))
                 .overlay(RoundedRectangle(cornerRadius: 8)
-                    .stroke(active ? Color.clear : Color(white: 0.42), lineWidth: 1))
+                    .stroke(active ? Color.clear : UI.chipBorder, lineWidth: 1))
         }
         .buttonStyle(.plain)
     }
@@ -1122,9 +1155,11 @@ struct ActionButton: View {
     let label: String; let color: Color; let action: () -> Void
     var body: some View {
         Button(action: action) {
+            // White on a filled accent, not the palette's near-black: this sits on
+            // colour, not on the light ground everything else does.
             Text(label).font(.system(size: 11, weight: .medium)).foregroundColor(.white)
                 .frame(maxWidth: .infinity).padding(.vertical, 7)
-                .background(RoundedRectangle(cornerRadius: 8).fill(color.opacity(0.85)))
+                .background(RoundedRectangle(cornerRadius: 8).fill(color))
         }.buttonStyle(.plain)
     }
 }
@@ -1134,9 +1169,9 @@ struct TabButton: View {
     var body: some View {
         Button(action: action) {
             Text(title).font(.system(size: 12, weight: active ? .semibold : .regular))
-                .foregroundColor(active ? .white : .white.opacity(0.5))
+                .foregroundColor(active ? .white : UI.text(0.5))
                 .padding(.vertical, 6).frame(maxWidth: .infinity)
-                .background(active ? Color(white: 0.2) : Color.clear)
+                .background(active ? UI.tabActive : Color.clear)
                 .clipShape(RoundedRectangle(cornerRadius: 8))
         }.buttonStyle(.plain)
     }
@@ -1144,10 +1179,10 @@ struct TabButton: View {
 
 struct StatRow: View {
     let label: String; let value: String
-    var accent: Color = .white
+    var accent: Color = UI.text
     var body: some View {
         HStack {
-            Text(label).font(.system(size: 12)).foregroundColor(.white.opacity(0.55))
+            Text(label).font(.system(size: 12)).foregroundColor(UI.text(0.55))
             Spacer()
             Text(value).font(.system(size: 12, weight: .medium)).foregroundColor(accent)
                 .monospacedDigit()
@@ -1192,7 +1227,7 @@ struct PowerFlowView: View {
 
     var edges: [Edge] {
         let s = model.snap
-        let GREEN = Color.green, ORANGE = Color.orange, WHITE = Color.white.opacity(0.9)
+        let GREEN = UI.good, ORANGE = UI.warn, WHITE = UI.text(0.55)
         let AM = (CGPoint(x: 150, y: 54), CGPoint(x: 210, y: 54))
         let AB = (CGPoint(x: 120, y: 82),  CGPoint(x: 150, y: 132))
         let BM = (CGPoint(x: 210, y: 132), CGPoint(x: 240, y: 82))
@@ -1243,19 +1278,19 @@ struct PowerFlowView: View {
             // pushes the bottom row onto the divider below instead of clipping.
             .frame(height: 292)
 
-            Divider().background(Color(white: 0.3)).padding(.horizontal, 16)
+            Divider().background(UI.divider).padding(.horizontal, 16)
 
             HStack {
-                Text(footerText).font(.system(size: 11)).foregroundColor(.white.opacity(0.6))
+                Text(footerText).font(.system(size: 11)).foregroundColor(UI.text(0.6))
                 Spacer()
                 Button(action: { NSApp.terminate(nil) }) {
                     Text("종료").font(.system(size: 11))
-                }.buttonStyle(.plain).foregroundColor(.white.opacity(0.7))
+                }.buttonStyle(.plain).foregroundColor(UI.text(0.7))
             }
             .padding(.horizontal, 16).padding(.vertical, 9)
         }
         .frame(width: 380)
-        .background(Color(white: 0.11))
+        .background(UI.background)
     }
 
     // MARK: Tab 1 — flow
@@ -1263,9 +1298,9 @@ struct PowerFlowView: View {
         let s = model.snap
         let cap = caption
         return VStack(spacing: 0) {
-            Text(cap.0).font(.system(size: 15, weight: .semibold)).foregroundColor(.white)
+            Text(cap.0).font(.system(size: 15, weight: .semibold)).foregroundColor(UI.textStrong)
                 .padding(.top, 4)
-            Text(cap.1).font(.system(size: 11)).foregroundColor(.white.opacity(0.5))
+            Text(cap.1).font(.system(size: 11)).foregroundColor(UI.text(0.5))
                 .padding(.top, 3).frame(height: 16)
             ZStack(alignment: .topLeading) {
                 FlowCanvas(edges: edges)
@@ -1277,21 +1312,21 @@ struct PowerFlowView: View {
                 // battery's. It used to show the battery reading on both.
                 NodeBox(emoji: "💻", label: "맥 사용", value: fmtW(s.systemW), dim: false,
                         sub: model.cpuTempC > 0 ? String(format: "🌡 %.0f°C", model.cpuTempC) : nil,
-                        subColor: model.cpuTempC >= 90 ? .orange : .white.opacity(0.5))
+                        subColor: model.cpuTempC >= 90 ? UI.warn : UI.text(0.5))
                     .position(macC)
                 NodeBox(emoji: "🔋", label: "배터리", value: "\(s.soc)%\(battArrow)", dim: false,
                         sub: s.tempC > 0 ? String(format: "🌡 %.1f°C", s.tempC) : nil,
-                        subColor: s.tempC >= 40 ? .orange : .white.opacity(0.5))
+                        subColor: s.tempC >= 40 ? UI.warn : UI.text(0.5))
                     .position(battC)
             }
             .frame(width: 360, height: 198)
             if model.history.count > 1 {
                 VStack(alignment: .leading, spacing: 2) {
                     HStack {
-                        Text(model.historySpan).font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
+                        Text(model.historySpan).font(.system(size: 9)).foregroundColor(UI.text(0.35))
                         Spacer()
                         Text(String(format: "최대 %.1fW", model.history.max() ?? 0))
-                            .font(.system(size: 9)).foregroundColor(.white.opacity(0.35)).monospacedDigit()
+                            .font(.system(size: 9)).foregroundColor(UI.text(0.35)).monospacedDigit()
                     }
                     Sparkline(samples: model.history).frame(height: 34)
                 }
@@ -1314,7 +1349,7 @@ struct PowerFlowView: View {
                 StatRow(label: "배터리 건강",
                         value: model.macHealthPct.map { "\($0)%  ·  \(model.macCondition.isEmpty ? s.condition : model.macCondition)" }
                             ?? "\(s.healthPct)%  ·  \(s.condition)",
-                        accent: (model.macHealthPct ?? s.healthPct) >= 80 ? .green : .orange)
+                        accent: (model.macHealthPct ?? s.healthPct) >= 80 ? UI.good : UI.warn)
                 StatRow(label: "  └ 원시 용량비 (raw)", value: "\(s.healthPct)%")
                 StatRow(label: "설계 용량", value: "\(s.designCap) mAh")
                 StatRow(label: "최대 용량(원시)", value: "\(s.rawMaxCap) mAh")
@@ -1324,26 +1359,26 @@ struct PowerFlowView: View {
                 StatRow(label: "현재 잔량", value: "\(s.soc) %")
                 StatRow(label: model.state == .charging ? "가득 차는 시간" : "남은 사용 시간",
                         value: timeValue)
-                Divider().background(Color(white: 0.25)).padding(.vertical, 4)
+                Divider().background(UI.divider).padding(.vertical, 4)
                 StatRow(label: "전원 어댑터",
                         value: s.external ? "\(s.adapterRatedW) W" : "미연결",
-                        accent: s.external ? .white : .white.opacity(0.5))
+                        accent: s.external ? UI.text : UI.text(0.5))
                 if s.external {
                     StatRow(label: "  └ 전압 / 전류",
                             value: String(format: "%.1f V · %.2f A", s.adapterVoltage, s.adapterCurrent))
                     if let pd = s.activePD {
                         StatRow(label: "  └ 협상 프로파일",
                                 value: "\(pd.label)  (\(String(format: "%.0fW", pd.watts)))",
-                                accent: .green)
+                                accent: UI.good)
                         if s.pdProfiles.count > 1 {
                             HStack(spacing: 4) {
                                 Text("      제공 프로파일").font(.system(size: 10))
-                                    .foregroundColor(.white.opacity(0.4))
+                                    .foregroundColor(UI.text(0.4))
                                 Spacer()
                                 ForEach(s.pdProfiles) { p in
                                     Text(p.label)
                                         .font(.system(size: 9, weight: p.index == s.pdActiveIndex ? .bold : .regular))
-                                        .foregroundColor(p.index == s.pdActiveIndex ? .green : .white.opacity(0.4))
+                                        .foregroundColor(p.index == s.pdActiveIndex ? .green : UI.text(0.4))
                                         .padding(.vertical, 1).padding(.horizontal, 4)
                                         .background(RoundedRectangle(cornerRadius: 4)
                                             .fill(p.index == s.pdActiveIndex ? Color.green.opacity(0.15) : Color.clear))
@@ -1355,7 +1390,7 @@ struct PowerFlowView: View {
                     if s.adapterLossW > 0, let eff = s.adapterEfficiency {
                         StatRow(label: "  └ 어댑터 손실",
                                 value: String(format: "%.2f W  ·  효율 %.1f%%", s.adapterLossW, eff * 100),
-                                accent: eff >= 0.9 ? .white : .orange)
+                                accent: eff >= 0.9 ? UI.text : UI.warn)
                         StatRow(label: "  └ 벽면 소비(추정)", value: String(format: "%.2f W", s.wallW))
                     }
                     if !s.adapterDesc.isEmpty {
@@ -1366,35 +1401,35 @@ struct PowerFlowView: View {
                     StatRow(label: "직렬번호", value: s.serial)
                 }
                 if s.cellVoltages.count > 1 {
-                    Divider().background(Color(white: 0.25)).padding(.vertical, 4)
+                    Divider().background(UI.divider).padding(.vertical, 4)
                     StatRow(label: "배터리 셀", value: "\(s.cellVoltages.count)셀")
                     StatRow(label: "  └ 셀 전압",
                             value: s.cellVoltages.map { String(format: "%.3f", $0) }.joined(separator: " / ") + " V")
                     if let spread = s.cellSpreadMV {
                         StatRow(label: "  └ 셀 편차", value: "\(spread) mV",
-                                accent: spread >= 50 ? .orange : .green)
+                                accent: spread >= 50 ? UI.warn : UI.good)
                     }
                     if s.cellRa.count == s.cellVoltages.count {
                         StatRow(label: "  └ 내부 저항",
                                 value: s.cellRa.map(String.init).joined(separator: " / "))
                     }
                     Text("셀 편차는 부하가 걸리면 커집니다. 저항이 높은 셀이 더 많이 떨어지기 때문이며, 무부하일 때의 값이 노화 지표입니다.")
-                        .font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
+                        .font(.system(size: 9)).foregroundColor(UI.text(0.35))
                         .fixedSize(horizontal: false, vertical: true)
                         .padding(.top, 2)
                 }
                 if s.dailyMinSoc >= 0 && s.dailyMaxSoc >= 0 {
-                    Divider().background(Color(white: 0.25)).padding(.vertical, 4)
+                    Divider().background(UI.divider).padding(.vertical, 4)
                     StatRow(label: "오늘 사용 구간",
                             value: "\(s.dailyMinSoc)% – \(s.dailyMaxSoc)%  (\(s.dailyMaxSoc - s.dailyMinSoc)%p)")
                 }
                 if s.lifeHours > 0 {
-                    Divider().background(Color(white: 0.25)).padding(.vertical, 4)
+                    Divider().background(UI.divider).padding(.vertical, 4)
                     StatRow(label: "평생 기록", value: "")
                     StatRow(label: "  └ 총 가동 시간", value: "\(s.lifeHours) 시간")
                     StatRow(label: "  └ 온도 범위",
                             value: String(format: "%.1f ~ %.1f °C  (평균 %.1f)", s.lifeMinTempC, s.lifeMaxTempC, s.lifeAvgTempC),
-                            accent: s.lifeMaxTempC >= 45 ? .orange : .white)
+                            accent: s.lifeMaxTempC >= 45 ? UI.warn : UI.text)
                     StatRow(label: "  └ 최대 충전 / 방전",
                             value: String(format: "%.2f A / %.2f A", s.lifeMaxChargeA, s.lifeMaxDischargeA))
                     StatRow(label: "  └ 팩 전압 범위",
@@ -1403,22 +1438,22 @@ struct PowerFlowView: View {
                 if s.permanentFailure != 0 || s.cellDisconnects != 0 {
                     StatRow(label: "  └ 고장 지표",
                             value: "영구고장 \(s.permanentFailure) · 셀단선 \(s.cellDisconnects)",
-                            accent: .orange)
+                            accent: UI.warn)
                 }
-                Divider().background(Color(white: 0.25)).padding(.vertical, 4)
+                Divider().background(UI.divider).padding(.vertical, 4)
                 HStack {
                     Text("에너지 사용 상위 앱").font(.system(size: 12, weight: .medium))
-                        .foregroundColor(.white.opacity(0.7))
+                        .foregroundColor(UI.text(0.7))
                     Spacer()
-                    Text("CPU 기준").font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
+                    Text("CPU 기준").font(.system(size: 9)).foregroundColor(UI.text(0.35))
                 }
                 if topApps.apps.isEmpty {
-                    Text("측정 중…").font(.system(size: 11)).foregroundColor(.white.opacity(0.4))
+                    Text("측정 중…").font(.system(size: 11)).foregroundColor(UI.text(0.4))
                         .frame(maxWidth: .infinity, alignment: .leading)
                 } else {
                     ForEach(topApps.apps) { a in
                         StatRow(label: a.name, value: String(format: "%.0f%%", a.cpu),
-                                accent: a.cpu > 50 ? .orange : .white)
+                                accent: a.cpu > 50 ? UI.warn : UI.text)
                     }
                 }
             }
@@ -1450,7 +1485,7 @@ struct PowerFlowView: View {
     func tempColor(_ c: Double) -> Color {
         if c >= 100 { return .red }
         if c >= 90 { return .orange }
-        return .white
+        return UI.text
     }
 
     // MARK: Tab — temperature
@@ -1462,12 +1497,12 @@ struct PowerFlowView: View {
     var tempTab: some View {
         VStack(alignment: .leading, spacing: 5) {
             if model.cpuTempC <= 0 && model.snap.tempC <= 0 {
-                Text("센서를 읽는 중…").font(.system(size: 11)).foregroundColor(.white.opacity(0.4))
+                Text("센서를 읽는 중…").font(.system(size: 11)).foregroundColor(UI.text(0.4))
                     .frame(maxWidth: .infinity, alignment: .center).padding(.top, 40)
             } else {
                 HStack(alignment: .firstTextBaseline) {
                     Circle().fill(TempPalette.cpu).frame(width: 7, height: 7)
-                    Text("CPU").font(.system(size: 12)).foregroundColor(.white.opacity(0.6))
+                    Text("CPU").font(.system(size: 12)).foregroundColor(UI.text(0.6))
                     Spacer()
                     Text(model.cpuTempC > 0 ? String(format: "%.1f °C", model.cpuTempC) : "—")
                         .font(.system(size: 24, weight: .bold)).monospacedDigit()
@@ -1475,30 +1510,30 @@ struct PowerFlowView: View {
                     // Sensors, not cores: an M2 Max has 12 cores and 112 CPU sensors.
                     Text(model.cpuSensorCount > 0 ? "센서 \(model.cpuSensorCount)" : "")
                         .font(.system(size: 8))
-                        .foregroundColor(.white.opacity(0.25)).frame(width: 42, alignment: .leading)
+                        .foregroundColor(UI.text(0.25)).frame(width: 42, alignment: .leading)
                 }
                 HStack(alignment: .firstTextBaseline) {
                     Circle().fill(TempPalette.batt).frame(width: 7, height: 7)
-                    Text("배터리").font(.system(size: 12)).foregroundColor(.white.opacity(0.6))
+                    Text("배터리").font(.system(size: 12)).foregroundColor(UI.text(0.6))
                     Spacer()
                     Text(model.snap.tempC > 0 ? String(format: "%.1f °C", model.snap.tempC) : "—")
                         .font(.system(size: 24, weight: .bold)).monospacedDigit()
-                        .foregroundColor(model.snap.tempC >= 40 ? .orange : .white)
+                        .foregroundColor(model.snap.tempC >= 40 ? UI.warn : UI.textStrong)
                     Text(model.batteryTempKey ?? "IOKit").font(.system(size: 8))
-                        .foregroundColor(.white.opacity(0.25)).frame(width: 30, alignment: .leading)
+                        .foregroundColor(UI.text(0.25)).frame(width: 30, alignment: .leading)
                 }
 
                 if model.fanRPMs.isEmpty {
-                    StatRow(label: "팬", value: "없음 (팬리스 모델)", accent: .white.opacity(0.45))
+                    StatRow(label: "팬", value: "없음 (팬리스 모델)", accent: UI.text(0.45))
                 } else {
                     ForEach(Array(model.fanRPMs.enumerated()), id: \.offset) { i, rpm in
                         StatRow(label: model.fanRPMs.count > 1 ? "팬 \(i + 1)" : "팬",
                                 value: rpm > 0 ? String(format: "%.0f RPM", rpm) : "정지",
-                                accent: rpm > 0 ? .white : .white.opacity(0.45))
+                                accent: rpm > 0 ? UI.text : UI.text(0.45))
                     }
                 }
 
-                Divider().background(Color(white: 0.25)).padding(.top, 3)
+                Divider().background(UI.divider).padding(.top, 3)
                 let cpuChart = TempSeriesChart(samples: model.tempHistory, value: { $0.cpu }, color: TempPalette.cpu)
                 let battChart = TempSeriesChart(samples: model.tempHistory, value: { $0.batt }, color: TempPalette.batt)
                 if model.tempHistory.count > 1 {
@@ -1507,7 +1542,7 @@ struct PowerFlowView: View {
                             Text("CPU").font(.system(size: 9)).foregroundColor(TempPalette.cpu.opacity(0.8))
                             Spacer()
                             Text(cpuChart.label).font(.system(size: 9))
-                                .foregroundColor(.white.opacity(0.35)).monospacedDigit()
+                                .foregroundColor(UI.text(0.35)).monospacedDigit()
                         }
                         cpuChart.frame(height: 62)
                     }
@@ -1516,20 +1551,20 @@ struct PowerFlowView: View {
                             Text("배터리").font(.system(size: 9)).foregroundColor(TempPalette.batt.opacity(0.8))
                             Spacer()
                             Text(battChart.label).font(.system(size: 9))
-                                .foregroundColor(.white.opacity(0.35)).monospacedDigit()
+                                .foregroundColor(UI.text(0.35)).monospacedDigit()
                         }
                         battChart.frame(height: 38)
                     }
                     HStack {
-                        Text("1시간 전").font(.system(size: 9)).foregroundColor(.white.opacity(0.28))
+                        Text("1시간 전").font(.system(size: 9)).foregroundColor(UI.text(0.28))
                         Spacer()
                         Text("기록 \(model.tempHistorySpan)").font(.system(size: 9))
-                            .foregroundColor(.white.opacity(0.28))
+                            .foregroundColor(UI.text(0.28))
                         Spacer()
-                        Text("지금").font(.system(size: 9)).foregroundColor(.white.opacity(0.28))
+                        Text("지금").font(.system(size: 9)).foregroundColor(UI.text(0.28))
                     }
                 } else {
-                    Text("기록을 모으는 중…").font(.system(size: 10)).foregroundColor(.white.opacity(0.3))
+                    Text("기록을 모으는 중…").font(.system(size: 10)).foregroundColor(UI.text(0.3))
                         .frame(maxWidth: .infinity, minHeight: 120)
                 }
             }
@@ -1548,7 +1583,7 @@ struct PowerFlowView: View {
     var settingsTab: some View {
         VStack(alignment: .leading, spacing: 14) {
             VStack(alignment: .leading, spacing: 6) {
-                Text("메뉴바 표시").font(.system(size: 12)).foregroundColor(.white.opacity(0.8))
+                Text("메뉴바 표시").font(.system(size: 12)).foregroundColor(UI.text(0.8))
                 HStack(spacing: 6) {
                     ChoiceChip(label: "아이콘", active: draftMode == MenuBarMode.icon.rawValue,
                                action: { draftMode = MenuBarMode.icon.rawValue }, minWidth: 40)
@@ -1561,12 +1596,12 @@ struct PowerFlowView: View {
                 }
                 // The chips only move the draft; the menu bar changes on 확인.
                 HStack(spacing: 6) {
-                    Text("미리보기").font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
+                    Text("미리보기").font(.system(size: 9)).foregroundColor(UI.text(0.35))
                     Text(model.menuBarTitle(MenuBarMode(rawValue: draftMode) ?? .full))
                         .font(.system(size: 11, weight: .medium)).monospacedDigit()
-                        .foregroundColor(Color(nsColor: model.menuBarColor))
+                        .foregroundColor(model.previewColor)
                         .padding(.vertical, 2).padding(.horizontal, 6)
-                        .background(RoundedRectangle(cornerRadius: 5).fill(Color(white: 0.22)))
+                        .background(RoundedRectangle(cornerRadius: 5).fill(UI.inset))
                     Spacer()
                     // The 확인 button's presence is itself the "not applied yet" signal;
                     // a separate warning and an undo button only restated it.
@@ -1584,7 +1619,7 @@ struct PowerFlowView: View {
 
             VStack(alignment: .leading, spacing: 4) {
                 HStack {
-                    Text("갱신 주기").font(.system(size: 12)).foregroundColor(.white.opacity(0.8))
+                    Text("갱신 주기").font(.system(size: 12)).foregroundColor(UI.text(0.8))
                     Spacer()
                     ForEach([1.0, 2.0, 5.0], id: \.self) { v in
                         ChoiceChip(label: "\(Int(v))초", active: refreshInterval == v, action: {
@@ -1597,22 +1632,22 @@ struct PowerFlowView: View {
                      ? "전력값은 SMC에서 실시간으로 읽습니다 · 용량·사이클은 60초 주기"
                      : "SMC 사용 불가 — 전력값도 IOKit 60초 갱신값을 씁니다")
                     .font(.system(size: 9))
-                    .foregroundColor(model.snap.live ? .white.opacity(0.35) : .orange.opacity(0.8))
+                    .foregroundColor(model.snap.live ? UI.text(0.35) : .orange.opacity(0.8))
             }
             Toggle(isOn: $showDecimals) {
-                Text("전력 소수점 표시 (3.4W / 3W)").font(.system(size: 12)).foregroundColor(.white.opacity(0.85))
+                Text("전력 소수점 표시 (3.4W / 3W)").font(.system(size: 12)).foregroundColor(UI.text(0.85))
             }.toggleStyle(.switch).tint(.green)
 
             Toggle(isOn: Binding(
                 get: { SMAppService.mainApp.status == .enabled },
                 set: { on in try? (on ? SMAppService.mainApp.register() : SMAppService.mainApp.unregister()) }
             )) {
-                Text("로그인 시 자동 시작").font(.system(size: 12)).foregroundColor(.white.opacity(0.85))
+                Text("로그인 시 자동 시작").font(.system(size: 12)).foregroundColor(UI.text(0.85))
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.9.2  ·  SMC + IOKit + battery 엔진")
-                .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
+            Text("PowerMeter 2.0  ·  SMC + IOKit + battery 엔진")
+                .font(.system(size: 9)).foregroundColor(UI.text(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
         .padding(.horizontal, 16).padding(.top, 14)
@@ -1624,22 +1659,22 @@ struct PowerFlowView: View {
         VStack(spacing: 12) {
             HStack {
                 Text("충전 제한").font(.system(size: 13, weight: .medium))
-                    .foregroundColor(.white.opacity(0.85))
+                    .foregroundColor(UI.text(0.85))
                 Spacer()
                 if engine.installed {
                     Text(engine.limit.map { "\($0)%" } ?? "끔")
                         .font(.system(size: 15, weight: .bold))
-                        .foregroundColor(engine.limit == nil ? .white.opacity(0.5) : .green)
+                        .foregroundColor(engine.limit == nil ? UI.text(0.5) : UI.good)
                 } else {
-                    Text("엔진 미설치").font(.system(size: 12)).foregroundColor(.orange)
+                    Text("엔진 미설치").font(.system(size: 12)).foregroundColor(UI.warn)
                 }
             }
 
             // Why the adapter is attached but nothing is going into the battery.
             if let why = chargeHoldReason {
                 HStack(spacing: 5) {
-                    Text("ⓘ").font(.system(size: 10)).foregroundColor(.white.opacity(0.5))
-                    Text(why).font(.system(size: 10)).foregroundColor(.white.opacity(0.6))
+                    Text("ⓘ").font(.system(size: 10)).foregroundColor(UI.text(0.5))
+                    Text(why).font(.system(size: 10)).foregroundColor(UI.text(0.6))
                         .fixedSize(horizontal: false, vertical: true)
                     Spacer()
                 }
@@ -1651,7 +1686,7 @@ struct PowerFlowView: View {
                     HStack(spacing: 8) {
                         Button { let v = max(50, Int(sliderVal) - 5); sliderVal = Double(v); engine.setLimit(v) } label: {
                             Image(systemName: "minus.circle.fill").font(.system(size: 18))
-                        }.buttonStyle(.plain).foregroundColor(.white.opacity(0.6))
+                        }.buttonStyle(.plain).foregroundColor(UI.text(0.6))
 
                         Slider(value: $sliderVal, in: 50...100, step: 5) { editing in
                             if !editing { engine.setLimit(Int(sliderVal)) }
@@ -1659,10 +1694,10 @@ struct PowerFlowView: View {
 
                         Button { let v = min(100, Int(sliderVal) + 5); sliderVal = Double(v); engine.setLimit(v) } label: {
                             Image(systemName: "plus.circle.fill").font(.system(size: 18))
-                        }.buttonStyle(.plain).foregroundColor(.white.opacity(0.6))
+                        }.buttonStyle(.plain).foregroundColor(UI.text(0.6))
                     }
                     HStack { Text("50%"); Spacer(); Text("100%") }
-                        .font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
+                        .font(.system(size: 9)).foregroundColor(UI.text(0.35))
                 }
 
                 // presets
@@ -1675,47 +1710,47 @@ struct PowerFlowView: View {
 
                 Toggle(isOn: Binding(get: { engine.sailing }, set: { engine.setSailing($0) })) {
                     VStack(alignment: .leading, spacing: 1) {
-                        Text("Sailing (범위 유지)").font(.system(size: 11)).foregroundColor(.white.opacity(0.85))
+                        Text("Sailing (범위 유지)").font(.system(size: 11)).foregroundColor(UI.text(0.85))
                         Text(engine.sailing && engine.limit != nil
                              ? "\(max(50,(engine.limit ?? 80)-5))–\(engine.limit ?? 80)% 사이 유지"
-                             : "상한 도달 후 5% 내려가면 재충전").font(.system(size: 9)).foregroundColor(.white.opacity(0.4))
+                             : "상한 도달 후 5% 내려가면 재충전").font(.system(size: 9)).foregroundColor(UI.text(0.4))
                     }
                 }
                 .toggleStyle(.switch).tint(.green)
 
-                Divider().background(Color(white: 0.25))
+                Divider().background(UI.divider)
 
                 // actions
                 HStack(spacing: 6) {
                     ActionButton(label: "충전 100%", color: .green) { engine.forceCharge() }
                     ActionButton(label: "방전", color: .orange) { confirmDischarge = true }
-                    ActionButton(label: "캘리브레이션", color: Color(white: 0.35)) { confirmCalibrate = true }
+                    ActionButton(label: "캘리브레이션", color: UI.neutralFill) { confirmCalibrate = true }
                 }
                 Text("방전: 어댑터 연결 중에도 제한%까지 강제 방전 · 캘리브레이션: 15→100→80% 전체 사이클")
-                    .font(.system(size: 9)).foregroundColor(.white.opacity(0.4))
+                    .font(.system(size: 9)).foregroundColor(UI.text(0.4))
                     .frame(maxWidth: .infinity, alignment: .leading)
                 HStack {
-                    Text("마지막 보정").font(.system(size: 10)).foregroundColor(.white.opacity(0.45))
+                    Text("마지막 보정").font(.system(size: 10)).foregroundColor(UI.text(0.45))
                     Spacer()
-                    Text(calibrationText).font(.system(size: 10)).foregroundColor(.white.opacity(0.6))
+                    Text(calibrationText).font(.system(size: 10)).foregroundColor(UI.text(0.6))
                 }
             } else {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("충전 제한 엔진(battery)이 설치되지 않았습니다.")
-                        .font(.system(size: 11)).foregroundColor(.orange)
+                        .font(.system(size: 11)).foregroundColor(UI.warn)
                     Text("설치하면 이 탭에서 충전 상한·방전·캘리브레이션을 제어합니다.\n관리자 인증 한 번으로 진행되며, 실행할 명령은 누르면 먼저 보여줍니다.")
-                        .font(.system(size: 10)).foregroundColor(.white.opacity(0.45))
+                        .font(.system(size: 10)).foregroundColor(UI.text(0.45))
                     if let c = engine.conflictingApp {
                         Text("⚠️ \(c)이(가) 설치돼 있습니다. 같은 SMC 키를 두고 충돌하므로 먼저 제거하세요.")
-                            .font(.system(size: 10)).foregroundColor(.orange)
+                            .font(.system(size: 10)).foregroundColor(UI.warn)
                     }
                     ActionButton(label: engine.busy ? "설치 중…" : "엔진 설치",
-                                 color: engine.busy ? Color(white: 0.35) : .green) {
+                                 color: engine.busy ? UI.neutralFill : .green) {
                         if !engine.busy { confirmInstall = true }
                     }
                     if let m = engine.lastMessage {
                         Text(m).font(.system(size: 10))
-                            .foregroundColor(m.hasSuffix("완료") ? .green : .orange)
+                            .foregroundColor(m.hasSuffix("완료") ? UI.good : UI.warn)
                             .fixedSize(horizontal: false, vertical: true)
                     }
                 }
@@ -1727,7 +1762,7 @@ struct PowerFlowView: View {
                     Spacer()
                     Button(action: { if !engine.busy { confirmUninstall = true } }) {
                         Text(engine.busy ? "제거 중…" : "엔진 제거")
-                            .font(.system(size: 10)).foregroundColor(.white.opacity(0.4))
+                            .font(.system(size: 10)).foregroundColor(UI.text(0.4))
                     }.buttonStyle(.plain)
                 }
             }
@@ -1807,16 +1842,44 @@ extension PowerModel {
         let icon = snap.external ? "🔌" : "🔋"
         switch mode {
         case .icon:    return icon
-        case .percent: return "\(icon) \(snap.soc)%"
-        case .watts:   return "\(icon) \(fmtW(snap.systemW))"
+        case .percent: return "\(icon) \(Self.pct(snap.soc))"
+        case .watts:   return "\(icon) \(Self.watts(snap.systemW))"
         case .full:
             let flow: String
             switch state {
-            case .charging: flow = " ＋\(fmtW(chargeW))"
-            case .boost:    flow = " ▼\(fmtW(dischargeW))"
+            case .charging: flow = " ＋\(Self.watts(chargeW))"
+            case .boost:    flow = " ▼\(Self.watts(dischargeW))"
             default:        flow = ""
             }
-            return "\(icon) \(snap.soc)% \(fmtW(snap.systemW))\(flow)"
+            return "\(icon) \(Self.pct(snap.soc)) \(Self.watts(snap.systemW))\(flow)"
+        }
+    }
+
+    // Fixed-width numbers, padded with U+2007 FIGURE SPACE rather than a plain space.
+    // A monospaced-digit font only equalises the digits: an ordinary space measures
+    // 3.27pt against a digit's 7.74pt, so space-padding still left the item resizing
+    // every tick and shoving the rest of the menu bar sideways. FIGURE SPACE is a
+    // digit's width by definition, which holds the item still between state changes.
+    // 🔋 and 🔌 both measure 17.00pt, so the icon swap costs nothing either.
+    private static let figureSpace = "\u{2007}"
+    private static func pad(_ text: String, to columns: Int) -> String {
+        String(repeating: figureSpace, count: max(0, columns - text.count)) + text
+    }
+    private static func pct(_ v: Int) -> String { pad("\(min(999, max(0, v)))", to: 3) + "%" }
+    private static func watts(_ w: Double) -> String {
+        let dec = (UserDefaults.standard.object(forKey: "showDecimals") as? Bool) ?? true
+        let capped = min(999.9, max(0, w))
+        let body = dec ? String(format: "%.1f", capped) : String(format: "%.0f", capped)
+        return pad(body, to: dec ? 5 : 3) + "W"
+    }
+
+    /// The menu bar's own colour, remapped for the light popover. systemGreen is tuned
+    /// against the menu bar's backdrop and washes out on a near-white pill.
+    var previewColor: Color {
+        switch menuBarColor {
+        case NSColor.systemGreen:  return UI.good
+        case NSColor.systemOrange: return UI.warn
+        default:                   return UI.text
         }
     }
 
@@ -1843,6 +1906,7 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         engine.refresh()
         topApps.start()
         popover.behavior = .transient
+        popover.appearance = NSAppearance(named: .aqua)   // light regardless of the system setting
         // NSPopover adopts the hosting controller's own size once the view lays out,
         // so a hand-declared contentSize that disagrees makes the popover resize after
         // it is already on screen. The content is 58pt shorter than the 380 that used

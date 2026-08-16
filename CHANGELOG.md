@@ -4,6 +4,16 @@
 
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고, 버전은 [유의적 버전](https://semver.org/lang/ko/)을 따릅니다.
 
+## [2.0] — 2026-08-16
+
+### 변경
+- **밝은 모드로 고정했습니다.** 지금까지는 시스템 설정과 무관하게 항상 어두웠고, 밝은 모드를 쓰는 동안 팝오버만 검게 떠 있었습니다. 이제 어디서나 밝습니다. `NSPopover`의 창틀 외형도 함께 고정해, 시스템이 어두울 때 테두리만 검게 남는 일이 없습니다.
+- **메뉴바 항목이 흔들리지 않습니다.** 값이 바뀔 때마다 폭이 변해 메뉴바 전체가 좌우로 밀렸습니다. 숫자를 고정폭으로 맞췄고, 그 자리는 일반 공백이 아니라 `U+2007 FIGURE SPACE`로 채웁니다.
+
+색상은 `UI` 팔레트 한 곳에 모았습니다. 이전에는 여든 곳 넘게 흩어져 있었습니다.
+
+밝은 배경에서는 SwiftUI 기본 초록·주황이 흐려 보여, 글씨용으로는 어두운 변형을 따로 씁니다. 색을 채운 버튼과 칩 위 글씨는 흰색 그대로입니다.
+
 ## [1.9.2] — 2026-08-16
 
 ### 수정
@@ -197,6 +207,7 @@ SMC 접근에는 관리자 권한이 필요 없으며, battery 엔진 설치 여
 - 흐름 탭의 맥 노드에 배터리 온도 표시 (35°C 이상 주황색)
 - 어댑터 연결·해제 시 즉시 반응하는 메뉴바 아이콘
 
+[2.0]: https://github.com/GGAH1911/PowerMeter/releases/tag/v2.0
 [1.9.2]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.9.2
 [1.9.1]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.9.1
 [1.9]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.9
