@@ -433,13 +433,13 @@ final class PowerModel: ObservableObject {
 
     private var tempKeys: [String] = []
     private var watchKeys: [String] = []
-    // A dedicated, stable set of CPU sensors. The general watch list is the six
-    // hottest overall, which on some machines holds only one CPU sensor — and when a
-    // single tick's reading of it was implausible the reported CPU temperature fell to
-    // whatever else was in the list. Taking the maximum over the same set every tick
-    // removes that jump; cores trading places no longer moves the number.
+    // Every CPU sensor, not a selection of them. Averaging the eight hottest sounded
+    // cheaper but sampled the hot tail, so the figure sat well above the die and still
+    // moved 1.89°C a tick; across all of them it moves 0.44°C and spans 2.9°C instead
+    // of 12.9°C. Picking a spread-out subset is worse than either — it lands on
+    // whichever sensors happen to be quiet and stops tracking load at all.
+    // Costs ~16ms a tick on a 112-sensor M2 Max once key sizes are cached.
     private var cpuWatchKeys: [String] = []
-    private let cpuWatchCount = 8
     // Keys whose value was bit-identical across two sweeps. A threshold constant never
     // moves: an M2 Max publishes Tf46 at a fixed 102.8°C through idle, full load and
     // cooldown alike, and it would otherwise headline as the hottest sensor in red.
@@ -571,8 +571,7 @@ final class PowerModel: ObservableObject {
             // that matches IOKit's VirtualTemperature, and averaging in the cooler
             // TB2T would produce a number no other source reports.
             let fans = self.smc.fanRPMs()
-            let cpuSet = readings.filter(\.isCPU).sorted { $0.c > $1.c }
-                .prefix(self.cpuWatchCount).map(\.key)
+            let cpuSet = readings.filter(\.isCPU).map(\.key)
             DispatchQueue.main.async {
                 self.lastSweep = sampled
                 self.stuckCount = counts
@@ -1473,9 +1472,10 @@ struct PowerFlowView: View {
                     Text(model.cpuTempC > 0 ? String(format: "%.1f °C", model.cpuTempC) : "—")
                         .font(.system(size: 24, weight: .bold)).monospacedDigit()
                         .foregroundColor(tempColor(model.cpuTempC))
-                    Text(model.cpuSensorCount > 0 ? "코어 \(model.cpuSensorCount)" : "")
+                    // Sensors, not cores: an M2 Max has 12 cores and 112 CPU sensors.
+                    Text(model.cpuSensorCount > 0 ? "센서 \(model.cpuSensorCount)" : "")
                         .font(.system(size: 8))
-                        .foregroundColor(.white.opacity(0.25)).frame(width: 30, alignment: .leading)
+                        .foregroundColor(.white.opacity(0.25)).frame(width: 42, alignment: .leading)
                 }
                 HStack(alignment: .firstTextBaseline) {
                     Circle().fill(TempPalette.batt).frame(width: 7, height: 7)
@@ -1611,7 +1611,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.9.1  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.9.2  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
