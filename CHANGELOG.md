@@ -4,6 +4,14 @@
 
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고, 버전은 [유의적 버전](https://semver.org/lang/ko/)을 따릅니다.
 
+## [1.5.3] — 2026-08-16
+
+### 변경
+- **메뉴바 표시 미리보기 행을 단순화했습니다.** "적용 안 됨" 경고와 "되돌리기" 버튼을 없앴습니다. 확인 버튼이 떠 있다는 것 자체가 아직 적용되지 않았다는 뜻이고, 다른 항목을 다시 고르면 되돌아가므로 같은 말을 세 번 하고 있었습니다.
+
+### 수정
+- **설정 탭 하단 버전 문자열에 가로선이 그어져 보이던 문제.** 설정 탭 내용이 263pt인데 탭에 주어진 높이가 250pt여서 13pt가 넘쳤고, 맨 아래 버전 문자열이 그 아래 구분선 위로 겹쳐 그려졌습니다. 탭 높이를 268pt로 넓혀 가장 긴 탭이 여유 있게 들어갑니다.
+
 ## [1.5.2] — 2026-08-16
 
 ### 수정
@@ -75,6 +83,7 @@ SMC 접근에는 관리자 권한이 필요 없으며, battery 엔진 설치 여
 - 흐름 탭의 맥 노드에 배터리 온도 표시 (35°C 이상 주황색)
 - 어댑터 연결·해제 시 즉시 반응하는 메뉴바 아이콘
 
+[1.5.3]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.5.3
 [1.5.2]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.5.2
 [1.5.1]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.5.1
 [1.5]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.5

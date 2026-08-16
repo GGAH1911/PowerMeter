@@ -830,7 +830,9 @@ struct PowerFlowView: View {
                 default: settingsTab
                 }
             }
-            .frame(height: 250)
+            // Tallest tab is 설정 at 263pt; a shorter frame pushed its version line
+            // past the boundary and onto the divider below.
+            .frame(height: 268)
 
             Divider().background(Color(white: 0.3)).padding(.horizontal, 16)
 
@@ -1018,24 +1020,21 @@ struct PowerFlowView: View {
                 }
                 // The chips only move the draft; the menu bar changes on 확인.
                 HStack(spacing: 6) {
-                    Text(draftMode == menuBarMode ? "미리보기" : "미리보기 · 적용 안 됨")
-                        .font(.system(size: 9))
-                        .foregroundColor(draftMode == menuBarMode ? .white.opacity(0.35) : .orange.opacity(0.8))
+                    Text("미리보기").font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
                     Text(model.menuBarTitle(MenuBarMode(rawValue: draftMode) ?? .full))
                         .font(.system(size: 11, weight: .medium)).monospacedDigit()
                         .foregroundColor(Color(nsColor: model.menuBarColor))
                         .padding(.vertical, 2).padding(.horizontal, 6)
                         .background(RoundedRectangle(cornerRadius: 5).fill(Color(white: 0.22)))
                     Spacer()
+                    // The 확인 button's presence is itself the "not applied yet" signal;
+                    // a separate warning and an undo button only restated it.
                     if draftMode != menuBarMode {
                         Button(action: { menuBarMode = draftMode; model.onTick?() }) {
                             Text("확인").font(.system(size: 11, weight: .semibold))
                                 .foregroundColor(.white)
                                 .padding(.vertical, 4).padding(.horizontal, 12)
                                 .background(RoundedRectangle(cornerRadius: 7).fill(Color.green.opacity(0.85)))
-                        }.buttonStyle(.plain)
-                        Button(action: { draftMode = menuBarMode }) {
-                            Text("되돌리기").font(.system(size: 10)).foregroundColor(.white.opacity(0.45))
                         }.buttonStyle(.plain)
                     }
                 }
@@ -1071,7 +1070,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.5.2  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.5.3  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
