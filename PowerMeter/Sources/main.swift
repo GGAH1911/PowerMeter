@@ -115,14 +115,19 @@ struct TempReading: Identifiable {
         case "Te": return "CPU 다이"
         case "Th": return "SoC 히트싱크"
         case "Ts": return "SSD"
+        case "Tf": return "CPU 코어"
         case "Tg": return "GPU"
         default:   return nil
         }
     }
 
-    /// Tp/Te only. TC* mixes hot and cool sensors so its meaning is unclear, and
-    /// excluding it costs nothing — TCMz reads identical to the hottest Tp sensor.
-    var isCPU: Bool { key.hasPrefix("Tp") || key.hasPrefix("Te") }
+    /// Tp/Te/Tf. Tf carries the performance cores on M3, where Te holds only the
+    /// efficiency ones — without it an M3 would report the cooler half as its CPU
+    /// temperature. On an M2 Max the same prefix publishes a fixed 102.8°C instead,
+    /// which the stuck-value filter removes, so covering both costs nothing.
+    /// TC* is left out: it mixes hot and cool sensors, and TCMz reads identical to the
+    /// hottest Tp anyway.
+    var isCPU: Bool { key.hasPrefix("Tp") || key.hasPrefix("Te") || key.hasPrefix("Tf") }
 }
 
 struct PDProfile: Identifiable {
@@ -414,13 +419,17 @@ final class PowerModel: ObservableObject {
 
     private var tempKeys: [String] = []
     private var watchKeys: [String] = []
-    // Unidentified keys whose value was bit-identical across two sweeps. A threshold
-    // constant never moves: an M2 Max publishes Tf46 at a fixed 102.8°C through idle,
-    // full load and cooldown alike, and it would otherwise headline as the hottest
-    // sensor in red. Only sensors whose family is unknown are eligible — a resting
-    // battery legitimately holds one value, and TB*/Tp*/Te* are identified.
+    // Keys whose value was bit-identical across two sweeps. A threshold constant never
+    // moves: an M2 Max publishes Tf46 at a fixed 102.8°C through idle, full load and
+    // cooldown alike, and it would otherwise headline as the hottest sensor in red.
+    // Only the battery is exempt — it is the one family cross-checked against IOKit,
+    // and a resting pack legitimately holds one value. Everything else has to prove it
+    // is alive, because a prefix means different things on different chips: Tf is a
+    // performance core on M3 and a constant here.
     private var lastSweep: [String: Double] = [:]
-    private var stuckKeys: Set<String> = []
+    // Counted rather than latched: a key that starts moving again clears itself, so a
+    // sensor that merely happened to hold still for one comparison is not lost forever.
+    private var stuckCount: [String: Int] = [:]
     private let watchCount = 6
     private let historyCap = 300
 
@@ -494,18 +503,28 @@ final class PowerModel: ObservableObject {
             if self.tempKeys.isEmpty {
                 self.tempKeys = self.smc.allKeys().filter { $0.hasPrefix("T") }
             }
-            var sampled: [String: Double] = [:]
-            var readings: [TempReading] = []
-            for k in self.tempKeys {
-                guard let v = self.smc.readFloat(k), Self.plausible(v) else { continue }
-                sampled[k] = v
-                readings.append(TempReading(key: k, c: v))
+            func sample() -> [String: Double] {
+                var out: [String: Double] = [:]
+                for k in self.tempKeys {
+                    if let v = self.smc.readFloat(k), Self.plausible(v) { out[k] = v }
+                }
+                return out
             }
-            let previous = self.lastSweep
-            let newlyStuck = readings
-                .filter { $0.family == nil && previous[$0.key] == sampled[$0.key] }
-                .map(\.key)
-            let stuck = self.stuckKeys.union(newlyStuck)
+            // The very first sweep compares against nothing, so constants would headline
+            // in red until the next one a minute later. Take a second pass a few seconds
+            // in to seed the comparison instead.
+            var previous = self.lastSweep
+            if previous.isEmpty {
+                previous = sample()
+                Thread.sleep(forTimeInterval: 5)
+            }
+            let sampled = sample()
+            var readings = sampled.map { TempReading(key: $0.key, c: $0.value) }
+            var counts = self.stuckCount
+            for r in readings where !r.isBattery {
+                counts[r.key] = (previous[r.key] == sampled[r.key]) ? (counts[r.key] ?? 0) + 1 : 0
+            }
+            let stuck = Set(counts.filter { $0.value >= 1 }.keys)
             // Battery is resolved from every reading; only ranking drops the stuck ones.
             let battKey = readings.filter(\.isBattery).map(\.key).sorted().first
             readings.removeAll { stuck.contains($0.key) }
@@ -522,7 +541,7 @@ final class PowerModel: ObservableObject {
             let fans = self.smc.fanRPMs()
             DispatchQueue.main.async {
                 self.lastSweep = sampled
-                self.stuckKeys = stuck
+                self.stuckCount = counts
                 self.watchKeys = hottest
                 if let battKey { self.batteryTempKey = battKey }
                 self.fanRPMs = fans
@@ -1437,7 +1456,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.7.1  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.7.2  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
