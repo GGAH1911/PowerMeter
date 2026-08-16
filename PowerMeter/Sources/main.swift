@@ -305,11 +305,13 @@ final class SMCReader {
         return keys
     }
 
-    /// Fan speeds in RPM. Empty on fanless Macs, where the keys are absent entirely.
-    func fanRPMs() -> [Double] {
-        guard let n = readUInt8("FNum"), n > 0, n < 10 else { return [] }
-        return (0..<n).compactMap { readFloat(String(format: "F%dAc", $0)) }
+    /// How many fans the machine has. Zero on fanless Macs, where the key is absent.
+    func fanCount() -> Int {
+        guard let n = readUInt8("FNum"), n > 0, n < 10 else { return 0 }
+        return n
     }
+    /// Current speed of one fan, in RPM.
+    func fanRPM(_ index: Int) -> Double? { readFloat(String(format: "F%dAc", index)) }
 
     /// System draw and adapter supply, in watts. Nil unless *both* keys read, so a
     /// machine that publishes only one degrades to the IOKit snapshot rather than
@@ -441,7 +443,11 @@ final class PowerModel: ObservableObject {
     // runs on the slow cycle off the main thread and only the hottest few are polled
     // per tick (1.65ms). The hot set is re-picked each sweep so it follows the load.
     @Published var temps: [TempReading] = []
+    // Speeds are read every tick like the temperatures. They were folded into the
+    // 60s sweep, so the displayed RPM sat frozen for a minute at a time while the
+    // hardware value moved every second (2306–2325 on one fan, measured).
     @Published var fanRPMs: [Double] = []
+    private var fanCount: Int = 0
     @Published var history: [Double] = []      // system watts, oldest first
     // CPU and battery temperature over the last hour. Trimmed by timestamp rather than
     // by sample count so the window stays an hour whatever the tick rate is set to.
@@ -603,7 +609,7 @@ final class PowerModel: ObservableObject {
             // Lowest-numbered TB sensor, not an average across them: TB0T is the one
             // that matches IOKit's VirtualTemperature, and averaging in the cooler
             // TB2T would produce a number no other source reports.
-            let fans = self.smc.fanRPMs()
+            let fanN = self.smc.fanCount()
             let cpuSet = readings.filter(\.isCPU).map(\.key)
             DispatchQueue.main.async {
                 self.lastSweep = sampled
@@ -611,7 +617,7 @@ final class PowerModel: ObservableObject {
                 if !cpuSet.isEmpty { self.cpuWatchKeys = cpuSet }
                 self.watchKeys = hottest
                 if let battKey { self.batteryTempKey = battKey }
-                self.fanRPMs = fans
+                self.fanCount = fanN
                 self.sweeping = false
             }
         }
@@ -688,6 +694,12 @@ final class PowerModel: ObservableObject {
         // Battery temperature comes from SMC when it can, so the flow, health and
         // temperature tabs cannot disagree about it. IOKit's value stays as fallback.
         if let k = batteryTempKey, let v = smc.readFloat(k) { s.tempC = v }
+        if fanCount > 0 {
+            let rpms = (0..<fanCount).compactMap { smc.fanRPM($0) }
+            if !rpms.isEmpty { fanRPMs = rpms }
+        } else if !fanRPMs.isEmpty {
+            fanRPMs = []
+        }
         history.append(s.systemW)
         if history.count > historyCap { history.removeFirst(history.count - historyCap) }
         if cpuTempC > 0 || s.tempC > 0 {
@@ -1648,7 +1660,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 2.1  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 2.1.1  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(UI.text(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }

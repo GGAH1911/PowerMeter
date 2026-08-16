@@ -4,6 +4,13 @@
 
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고, 버전은 [유의적 버전](https://semver.org/lang/ko/)을 따릅니다.
 
+## [2.1.1] — 2026-08-16
+
+### 수정
+- **팬 회전수가 화면에서 멈춰 있던 문제.** 팬 읽기를 온도 센서 전체 스윕에 얹어둔 탓에 **60초에 한 번만** 갱신됐습니다. 실제 하드웨어 값은 초 단위로 움직입니다(실측: 팬1 2306~2325, 팬2 2481~2516 RPM). 이제 팬 개수만 스윕에서 확인하고 회전수는 매 틱 읽습니다.
+
+CPU 온도와 배터리 온도는 처음부터 매 틱 읽고 있었는데 팬만 빠져 있었습니다.
+
 ## [2.1] — 2026-08-16
 
 ### 수정
@@ -217,6 +224,7 @@ SMC 접근에는 관리자 권한이 필요 없으며, battery 엔진 설치 여
 - 흐름 탭의 맥 노드에 배터리 온도 표시 (35°C 이상 주황색)
 - 어댑터 연결·해제 시 즉시 반응하는 메뉴바 아이콘
 
+[2.1.1]: https://github.com/GGAH1911/PowerMeter/releases/tag/v2.1.1
 [2.1]: https://github.com/GGAH1911/PowerMeter/releases/tag/v2.1
 [2.0]: https://github.com/GGAH1911/PowerMeter/releases/tag/v2.0
 [1.9.2]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.9.2
