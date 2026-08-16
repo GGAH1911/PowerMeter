@@ -130,6 +130,12 @@ struct TempReading: Identifiable {
     var isCPU: Bool { key.hasPrefix("Tp") || key.hasPrefix("Te") || key.hasPrefix("Tf") }
 }
 
+struct TempSample {
+    let at: Date
+    let cpu: Double
+    let batt: Double
+}
+
 struct PDProfile: Identifiable {
     let index: Int
     let volts: Double
@@ -404,6 +410,10 @@ final class PowerModel: ObservableObject {
     @Published var temps: [TempReading] = []
     @Published var fanRPMs: [Double] = []
     @Published var history: [Double] = []      // system watts, oldest first
+    // CPU and battery temperature over the last hour. Trimmed by timestamp rather than
+    // by sample count so the window stays an hour whatever the tick rate is set to.
+    @Published var tempHistory: [TempSample] = []
+    private let tempWindow: TimeInterval = 3600
 
     // The battery temperature every tab shows. SMC's first TB sensor reads within
     // 0.01°C of IOKit's VirtualTemperature, so it is the same measurement arriving
@@ -434,6 +444,17 @@ final class PowerModel: ObservableObject {
     private let historyCap = 300
 
     var maxTemp: TempReading? { temps.max { $0.c < $1.c } }
+    /// How far back the temperature chart reaches, from the samples themselves.
+    var tempHistorySpan: String {
+        guard let first = tempHistory.first, let last = tempHistory.last, tempHistory.count > 1 else {
+            return "최근 1시간"
+        }
+        let sec = Int(last.at.timeIntervalSince(first.at))
+        if sec >= 3600 { return "최근 1시간" }
+        if sec >= 60 { return "최근 \(sec / 60)분" }
+        return "최근 \(sec)초"
+    }
+
     /// How far back `history` reaches at the current tick rate.
     var historySpan: String {
         let sec = Int(Double(max(history.count - 1, 0)) * interval)
@@ -621,6 +642,14 @@ final class PowerModel: ObservableObject {
         if let k = batteryTempKey, let v = smc.readFloat(k) { s.tempC = v }
         history.append(s.systemW)
         if history.count > historyCap { history.removeFirst(history.count - historyCap) }
+        if cpuTempC > 0 || s.tempC > 0 {
+            let now = Date()
+            tempHistory.append(TempSample(at: now, cpu: cpuTempC, batt: s.tempC))
+            let cutoff = now.addingTimeInterval(-tempWindow)
+            if let keep = tempHistory.firstIndex(where: { $0.at >= cutoff }), keep > 0 {
+                tempHistory.removeFirst(keep)
+            }
+        }
 
         let adapterActive = s.external && s.adapterW > 0.5
         let dis = max(0, -s.batteryW)
@@ -969,6 +998,48 @@ struct Sparkline: View {
             ctx.fill(Path(ellipseIn: CGRect(x: last.x - 2.5, y: last.y - 2.5, width: 5, height: 5)),
                      with: .color(.green))
         }
+    }
+}
+
+/// CPU and battery temperature on one shared scale. Sharing it means the battery
+/// line sits low and flat, which is what the battery actually does — a second axis
+/// would stretch a 2°C drift into something that looks like a trend.
+struct TempChart: View {
+    let samples: [TempSample]
+    static let cpuColor = Color.orange
+    static let battColor = Color.teal
+
+    var body: some View {
+        let cpu = samples.map(\.cpu).filter { $0 > 0 }
+        let batt = samples.map(\.batt).filter { $0 > 0 }
+        let hi = max(cpu.max() ?? 0, batt.max() ?? 0, 1)
+        let lo = min(cpu.min() ?? hi, batt.min() ?? hi)
+        let span = max(hi - lo, 5)              // never zoom into sensor noise
+        return Canvas { ctx, size in
+            guard samples.count > 1 else { return }
+            let dx = size.width / CGFloat(samples.count - 1)
+            func draw(_ values: [Double], _ color: Color) {
+                var path = Path()
+                var started = false
+                for (i, v) in values.enumerated() where v > 0 {
+                    let y = size.height - CGFloat((v - lo) / span) * (size.height - 4) - 2
+                    let p = CGPoint(x: CGFloat(i) * dx, y: y)
+                    if started { path.addLine(to: p) } else { path.move(to: p); started = true }
+                }
+                guard started else { return }
+                ctx.stroke(path, with: .color(color), lineWidth: 1.5)
+            }
+            draw(samples.map(\.batt), Self.battColor)
+            draw(samples.map(\.cpu), Self.cpuColor)
+        }
+    }
+
+    var scaleLabel: String {
+        let cpu = samples.map(\.cpu).filter { $0 > 0 }
+        let batt = samples.map(\.batt).filter { $0 > 0 }
+        let hi = max(cpu.max() ?? 0, batt.max() ?? 0)
+        let lo = min(cpu.min() ?? hi, batt.min() ?? hi)
+        return String(format: "%.0f–%.0f°C", lo, hi)
     }
 }
 
@@ -1331,52 +1402,64 @@ struct PowerFlowView: View {
     }
 
     // MARK: Tab — temperature
+    //
+    // Only the two sensors whose identity is established: the CPU family maximum and
+    // the battery sensor cross-checked against IOKit. The rest of what SMC publishes
+    // is unlabelled keys of unknown provenance, and listing them invited reading
+    // meaning into numbers that have none.
     var tempTab: some View {
-        VStack(alignment: .leading, spacing: 0) {
-            if model.temps.isEmpty {
+        VStack(alignment: .leading, spacing: 5) {
+            if model.cpuTempC <= 0 && model.snap.tempC <= 0 {
                 Text("센서를 읽는 중…").font(.system(size: 11)).foregroundColor(.white.opacity(0.4))
                     .frame(maxWidth: .infinity, alignment: .center).padding(.top, 40)
             } else {
                 HStack(alignment: .firstTextBaseline) {
-                    Text("CPU 온도").font(.system(size: 12)).foregroundColor(.white.opacity(0.55))
+                    Circle().fill(TempChart.cpuColor).frame(width: 7, height: 7)
+                    Text("CPU").font(.system(size: 12)).foregroundColor(.white.opacity(0.6))
                     Spacer()
                     Text(model.cpuTempC > 0 ? String(format: "%.1f °C", model.cpuTempC) : "—")
-                        .font(.system(size: 22, weight: .bold)).monospacedDigit()
+                        .font(.system(size: 24, weight: .bold)).monospacedDigit()
                         .foregroundColor(tempColor(model.cpuTempC))
-                    Text(model.cpuTempKey ?? "").font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
+                    Text(model.cpuTempKey ?? "").font(.system(size: 8))
+                        .foregroundColor(.white.opacity(0.25)).frame(width: 30, alignment: .leading)
                 }
-                .padding(.bottom, 2)
-                if let m = model.maxTemp, !m.isCPU {
-                    StatRow(label: "최고 온도  (\(m.key))", value: String(format: "%.1f °C", m.c),
-                            accent: tempColor(m.c))
+                HStack(alignment: .firstTextBaseline) {
+                    Circle().fill(TempChart.battColor).frame(width: 7, height: 7)
+                    Text("배터리").font(.system(size: 12)).foregroundColor(.white.opacity(0.6))
+                    Spacer()
+                    Text(model.snap.tempC > 0 ? String(format: "%.1f °C", model.snap.tempC) : "—")
+                        .font(.system(size: 24, weight: .bold)).monospacedDigit()
+                        .foregroundColor(model.snap.tempC >= 40 ? .orange : .white)
+                    Text(model.batteryTempKey ?? "IOKit").font(.system(size: 8))
+                        .foregroundColor(.white.opacity(0.25)).frame(width: 30, alignment: .leading)
                 }
-                if model.snap.tempC > 0 {
-                    StatRow(label: "배터리" + (model.batteryTempKey.map { "  (\($0))" } ?? "  (IOKit)"),
-                            value: String(format: "%.1f °C", model.snap.tempC),
-                            accent: model.snap.tempC >= 40 ? .orange : .white)
-                }
+
                 if model.fanRPMs.isEmpty {
-                    StatRow(label: "팬", value: "없음 (팬리스 모델)", accent: .white.opacity(0.5))
+                    StatRow(label: "팬", value: "없음 (팬리스 모델)", accent: .white.opacity(0.45))
                 } else {
                     ForEach(Array(model.fanRPMs.enumerated()), id: \.offset) { i, rpm in
-                        StatRow(label: "팬 \(i + 1)", value: String(format: "%.0f RPM", rpm),
-                                accent: rpm > 0 ? .white : .white.opacity(0.5))
+                        StatRow(label: model.fanRPMs.count > 1 ? "팬 \(i + 1)" : "팬",
+                                value: rpm > 0 ? String(format: "%.0f RPM", rpm) : "정지",
+                                accent: rpm > 0 ? .white : .white.opacity(0.45))
                     }
                 }
-                Divider().background(Color(white: 0.25)).padding(.vertical, 5)
+
+                Divider().background(Color(white: 0.25)).padding(.top, 3)
+                let chart = TempChart(samples: model.tempHistory)
                 HStack {
-                    Text("가장 뜨거운 센서").font(.system(size: 11, weight: .medium))
-                        .foregroundColor(.white.opacity(0.7))
+                    Text(model.tempHistorySpan).font(.system(size: 9)).foregroundColor(.white.opacity(0.35))
                     Spacer()
-                    Text("SMC 키 원문").font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
+                    if model.tempHistory.count > 1 {
+                        Text(chart.scaleLabel).font(.system(size: 9))
+                            .foregroundColor(.white.opacity(0.35)).monospacedDigit()
+                    }
                 }
-                ForEach(model.temps) { t in
-                    StatRow(label: "  \(t.key)" + (t.family.map { "  \($0)" } ?? ""),
-                            value: String(format: "%.1f °C", t.c), accent: tempColor(t.c))
+                if model.tempHistory.count > 1 {
+                    chart.frame(height: 128)
+                } else {
+                    Text("기록을 모으는 중…").font(.system(size: 10)).foregroundColor(.white.opacity(0.3))
+                        .frame(maxWidth: .infinity, minHeight: 128)
                 }
-                Text("센서 키 이름은 Apple이 공개하지 않고 같은 키가 칩 세대마다 다른 것을 가리키기도 해서, 이름을 붙이지 않고 원문 그대로 표시합니다. 가장 뜨거운 센서는 보통 다이 온도라 부하 중 80~100°C는 정상이며 그 위에서 스로틀링이 걸립니다.")
-                    .font(.system(size: 9)).foregroundColor(.white.opacity(0.32))
-                    .fixedSize(horizontal: false, vertical: true).padding(.top, 4)
             }
             Spacer(minLength: 0)
         }
@@ -1456,7 +1539,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.7.2  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.8  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
