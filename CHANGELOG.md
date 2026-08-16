@@ -4,6 +4,13 @@
 
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고, 버전은 [유의적 버전](https://semver.org/lang/ko/)을 따릅니다.
 
+## [1.5.2] — 2026-08-16
+
+### 수정
+- **팝오버를 열고 잠시 후 상단 탭 바(흐름·건강·충전·설정)가 사라지던 문제.** 팝오버에 선언된 크기가 380×380이었는데 실제 내용 높이는 380×322로, 58pt가 어긋나 있었습니다. `NSPopover`는 화면에 뜬 뒤 내용의 실제 크기를 따라가며 줄어드는데, 그 차이를 위쪽에서 잘라내면서 탭 바가 있는 영역이 통째로 사라졌습니다. 이제 크기를 손으로 적지 않고 뷰 자신의 크기에서 가져오므로 어긋날 수 없습니다.
+
+기기에 따라 증상이 다르게 보였습니다(맥북에어는 정상, 맥북프로는 재현). 리사이즈 타이밍 차이일 뿐 크기 불일치는 두 기기 모두에 있었습니다.
+
 ## [1.5.1] — 2026-08-16
 
 ### 수정
@@ -68,6 +75,7 @@ SMC 접근에는 관리자 권한이 필요 없으며, battery 엔진 설치 여
 - 흐름 탭의 맥 노드에 배터리 온도 표시 (35°C 이상 주황색)
 - 어댑터 연결·해제 시 즉시 반응하는 메뉴바 아이콘
 
+[1.5.2]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.5.2
 [1.5.1]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.5.1
 [1.5]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.5
 [1.4]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.4

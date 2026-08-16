@@ -1071,7 +1071,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.5.1  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.5.2  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }
@@ -1303,8 +1303,17 @@ class AppDelegate: NSObject, NSApplicationDelegate {
         engine.refresh()
         topApps.start()
         popover.behavior = .transient
-        popover.contentSize = NSSize(width: 380, height: 380)
-        popover.contentViewController = NSHostingController(rootView: PowerFlowView(model: model, engine: engine, topApps: topApps))
+        // NSPopover adopts the hosting controller's own size once the view lays out,
+        // so a hand-declared contentSize that disagrees makes the popover resize after
+        // it is already on screen. The content is 58pt shorter than the 380 that used
+        // to be declared here, and the popover swallowed that difference off the top —
+        // exactly where the tab bar sits. Take the size from the view instead of
+        // guessing it, so it stays correct if the layout changes.
+        let host = NSHostingController(rootView: PowerFlowView(model: model, engine: engine, topApps: topApps))
+        host.view.layoutSubtreeIfNeeded()
+        let fitting = host.view.fittingSize
+        popover.contentSize = fitting.height > 0 ? fitting : NSSize(width: 380, height: 322)
+        popover.contentViewController = host
 
         if let btn = statusItem.button {
             btn.font = NSFont.monospacedDigitSystemFont(ofSize: 12, weight: .medium)
