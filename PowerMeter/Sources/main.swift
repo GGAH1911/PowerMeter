@@ -376,9 +376,14 @@ final class PowerModel: ObservableObject {
     // runs on the slow cycle off the main thread and only the hottest few are polled
     // per tick (1.65ms). The hot set is re-picked each sweep so it follows the load.
     @Published var temps: [TempReading] = []
-    @Published var batteryTempC: Double = 0
     @Published var fanRPMs: [Double] = []
     @Published var history: [Double] = []      // system watts, oldest first
+
+    // The battery temperature every tab shows. SMC's first TB sensor reads within
+    // 0.01°C of IOKit's VirtualTemperature, so it is the same measurement arriving
+    // sooner; IOKit's own Temperature is a different point on the pack and sits ~4°C
+    // lower. Reading one identified key keeps every tab on one number.
+    @Published private(set) var batteryTempKey: String?
 
     private var tempKeys: [String] = []
     private var watchKeys: [String] = []
@@ -460,14 +465,14 @@ final class PowerModel: ObservableObject {
                 if let v = self.smc.readFloat(k), v > 15, v < 110 { readings.append(TempReading(key: k, c: v)) }
             }
             let hottest = readings.sorted { $0.c > $1.c }.prefix(self.watchCount).map(\.key)
-            // TB* tracks what IOKit reports for the battery; average them so one warm
-            // cell does not stand in for the pack.
-            let batt = readings.filter(\.isBattery)
-            let battAvg = batt.isEmpty ? 0 : batt.map(\.c).reduce(0, +) / Double(batt.count)
+            // Lowest-numbered TB sensor, not an average across them: TB0T is the one
+            // that matches IOKit's VirtualTemperature, and averaging in the cooler
+            // TB2T would produce a number no other source reports.
+            let battKey = readings.filter(\.isBattery).map(\.key).sorted().first
             let fans = self.smc.fanRPMs()
             DispatchQueue.main.async {
                 self.watchKeys = hottest
-                if battAvg > 0 { self.batteryTempC = battAvg }
+                if let battKey { self.batteryTempKey = battKey }
                 self.fanRPMs = fans
                 self.sweeping = false
             }
@@ -526,6 +531,9 @@ final class PowerModel: ObservableObject {
             let readings = watchKeys.compactMap { k in smc.readFloat(k).map { TempReading(key: k, c: $0) } }
             if !readings.isEmpty { temps = readings.sorted { $0.c > $1.c } }
         }
+        // Battery temperature comes from SMC when it can, so the flow, health and
+        // temperature tabs cannot disagree about it. IOKit's value stays as fallback.
+        if let k = batteryTempKey, let v = smc.readFloat(k) { s.tempC = v }
         history.append(s.systemW)
         if history.count > historyCap { history.removeFirst(history.count - historyCap) }
 
@@ -1251,10 +1259,10 @@ struct PowerFlowView: View {
                     }
                 }
                 .padding(.bottom, 2)
-                if model.batteryTempC > 0 {
-                    StatRow(label: "배터리 (TB 센서 평균)",
-                            value: String(format: "%.1f °C", model.batteryTempC),
-                            accent: model.batteryTempC >= 35 ? .orange : .white)
+                if model.snap.tempC > 0 {
+                    StatRow(label: "배터리" + (model.batteryTempKey.map { "  (\($0))" } ?? "  (IOKit)"),
+                            value: String(format: "%.1f °C", model.snap.tempC),
+                            accent: model.snap.tempC >= 40 ? .orange : .white)
                 }
                 if model.fanRPMs.isEmpty {
                     StatRow(label: "팬", value: "없음 (팬리스 모델)", accent: .white.opacity(0.5))
@@ -1357,7 +1365,7 @@ struct PowerFlowView: View {
             }.toggleStyle(.switch).tint(.green)
 
             Spacer()
-            Text("PowerMeter 1.6.1  ·  SMC + IOKit + battery 엔진")
+            Text("PowerMeter 1.6.2  ·  SMC + IOKit + battery 엔진")
                 .font(.system(size: 9)).foregroundColor(.white.opacity(0.3))
                 .frame(maxWidth: .infinity, alignment: .center)
         }

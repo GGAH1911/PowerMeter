@@ -4,6 +4,18 @@
 
 형식은 [Keep a Changelog](https://keepachangelog.com/ko/1.1.0/)를 따르고, 버전은 [유의적 버전](https://semver.org/lang/ko/)을 따릅니다.
 
+## [1.6.2] — 2026-08-16
+
+### 수정
+- **배터리 온도가 탭마다 다르게 보이던 문제.** 흐름·건강 탭은 IOKit의 `Temperature`(30.8°C)를, 온도 탭은 SMC `TB*` 센서 평균(34.0°C)을 쓰고 있었습니다. 같은 이름의 값이 화면마다 4°C씩 달랐습니다. 이제 세 탭 모두 하나의 값을 씁니다.
+
+### 변경
+- **배터리 온도의 출처를 SMC로 통일했습니다.** SMC의 `TB0T`는 IOKit의 `VirtualTemperature`와 0.01°C 차이로 같은 측정값이며, 60초를 기다리지 않고 매 틱 갱신됩니다. SMC를 열 수 없는 환경에서는 기존 IOKit 값으로 폴백합니다.
+- 평균 대신 `TB0T` 하나를 씁니다. `TB2T`가 다른 센서보다 2~3°C 낮아, 평균을 내면 **어떤 출처도 보고하지 않는 숫자**가 만들어집니다.
+- 온도 탭이 배터리 온도 옆에 출처 키(`TB0T`)를 표시합니다.
+
+IOKit은 배터리 온도를 `Temperature`(30.8°C)와 `VirtualTemperature`(34.9°C) 두 개로 갖고 있고 서로 4°C 어긋납니다. 둘 다 정상이며 팩의 다른 지점을 잽니다. 어느 쪽이 유일한 진실이라고 부를 수 없어, 측정을 더 빨리 주는 쪽을 골랐습니다.
+
 ## [1.6.1] — 2026-08-16
 
 ### 수정
@@ -108,6 +120,7 @@ SMC 접근에는 관리자 권한이 필요 없으며, battery 엔진 설치 여
 - 흐름 탭의 맥 노드에 배터리 온도 표시 (35°C 이상 주황색)
 - 어댑터 연결·해제 시 즉시 반응하는 메뉴바 아이콘
 
+[1.6.2]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.6.2
 [1.6.1]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.6.1
 [1.6]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.6
 [1.5.3]: https://github.com/GGAH1911/PowerMeter/releases/tag/v1.5.3
